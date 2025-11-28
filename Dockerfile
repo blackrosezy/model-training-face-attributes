@@ -9,21 +9,26 @@ RUN apt-get update && apt-get install -y \
     && ln -s /usr/bin/python3.10 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app
-
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
+# Install uv (lightning-fast pip/venv)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Workdir that will be bind-mounted
+WORKDIR /app
+
+# Create venv OUTSIDE /app so bind mount doesn't mask it
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+RUN uv venv "${VIRTUAL_ENV}"
 
 # Install Python dependencies using uv
-RUN uv pip install --system torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-RUN uv pip install --system onnxruntime-gpu pillow tqdm onnx wandb
+RUN uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN uv pip install onnxruntime-gpu pillow tqdm onnx wandb
 
 # Copy application files
 COPY train_multitask.py .
