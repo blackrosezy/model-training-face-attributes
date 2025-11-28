@@ -4,6 +4,7 @@ services:
   multitask:
     build: .
     image: multitask-trainer:latest
+    shm_size: 2gb  # Needed for PyTorch dataloaders to avoid shared memory crashes.
     volumes:
       # Mount your data directory
       - ./data:/app/data
