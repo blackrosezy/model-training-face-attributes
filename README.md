@@ -16,14 +16,19 @@ Multi-task deep learning model that simultaneously predicts age range, emotion, 
 
 ## Setup
 
-1. **Build the Docker image:**
+1. **Create environment file:**
    ```bash
-   docker-compose build
+   cp .env.example .env
+   ```
+   
+   Edit `.env` and add your Weights & Biases API key:
+   ```
+   WANDB_API_KEY=your_actual_api_key_here
    ```
 
-2. **Set your Weights & Biases API key:**
+2. **Build the Docker image:**
    ```bash
-   export WANDB_API_KEY=your_api_key_here
+   docker-compose build
    ```
 
 ## Data Structure
