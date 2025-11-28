@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  multitask:
+    build: .
+    image: multitask-trainer:latest
+    volumes:
+      # Mount your data directory
+      - ./data:/app/data
+      # Mount current directory to preserve outputs
+      - ./:/app
+    environment:
+      # Set environment variables if needed
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    stdin_open: true
+    tty: true
+    command: bash
+    # GPU support for RTX 4080
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
