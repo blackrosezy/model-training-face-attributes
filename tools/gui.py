@@ -148,6 +148,25 @@ def load_pixmap(path: Path, size: int) -> QPixmap:
     return QPixmap() if img.isNull() else QPixmap.fromImage(img)
 
 
+def fmt_duration(sec: float) -> str:
+    sec = int(max(0, round(sec)))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
+
+
+def progress_text(done: int, total: int, started: float, unit: str = "", job_started: float = None) -> str:
+    """'37 / 100 images · elapsed 15s · 2.4/s · ~26s left'.
+    The estimate is based on `started` (this step); elapsed counts from `job_started` (whole job) if given."""
+    now = time.monotonic()
+    step = now - started
+    text = f"{done:,} / {total:,}{unit}  ·  elapsed {fmt_duration(now - (job_started or started))}"
+    if done > 0 and step >= 2 and done < total:
+        rate = done / step
+        text += f"  ·  {rate:.1f}/s  ·  ~{fmt_duration((total - done) / rate)} left"
+    return text
+
+
 def short_label(r: dict) -> str:
     g = {"female": "F", "male": "M"}.get(r["gender"], "?")
     return f"{r['age']} · {r['emotion']} · {g}"
@@ -515,6 +534,9 @@ class DupTab(QWidget):
         self.win, self.proc, self.groups = win, None, {}
         self.pending_remove = self.n_moved = 0
         self.widgets, self._titems, self._tbatch = {}, {}, None
+        self._job_t0 = self._phase_t0 = time.monotonic()
+        self._phase, self._pdone, self._ptotal, self._label = "", 0, 0, ""
+        self._tick = QTimer(self); self._tick.timeout.connect(self._tick_status)
 
         self.finder = QComboBox()
         offered = {n: c for n, c in dedup_registry.available().items() if not c.hidden}
@@ -729,25 +751,41 @@ class DupTab(QWidget):
         self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._output)
         self.proc.finished.connect(lambda code, _s: self._finished(code, label))
+        self._job_t0 = self._phase_t0 = time.monotonic(); self._phase, self._pdone, self._ptotal = "", 0, 0
+        self._label = label; self._tick.start(1000)
         self.progress.setRange(0, 0); self.status.setText(label + "…")
         self.win.log(f"{label}: python tools/dedup_cli.py " + " ".join(args))
         self.proc.start(sys.executable, ["-u", "tools/dedup_cli.py"] + args)
         self._update_buttons()
 
+    def _tick_status(self):
+        if not self.busy:
+            return
+        if self._ptotal:
+            self.status.setText(f"{self._phase}   " + progress_text(
+                self._pdone, self._ptotal, self._phase_t0, job_started=self._job_t0))
+        else:
+            self.status.setText(f"{self._label}…  elapsed {fmt_duration(time.monotonic() - self._job_t0)}")
+
     def _output(self):
         for line in bytes(self.proc.readAllStandardOutput()).decode(errors="replace").splitlines():
             if line.startswith("PROGRESS "):
                 _, phase, done, total = line.split()
-                self.progress.setRange(0, int(total)); self.progress.setValue(int(done))
-                self.status.setText(f"{phase}  {int(done):,} / {int(total):,}")
+                if phase != self._phase:                          # new step: restart its timer
+                    self._phase, self._phase_t0 = phase, time.monotonic()
+                self._pdone, self._ptotal = int(done), int(total)
+                self.progress.setRange(0, self._ptotal); self.progress.setValue(self._pdone)
+                self._tick_status()
             elif line.strip():
                 bad = "Traceback" in line or "Error" in line
                 self.win.log("[dedup] " + line, "ERROR" if bad else ("WARN" if line.startswith("WARN") else "PROC"))
 
     def _finished(self, code, label):
         self.progress.setRange(0, 1); self.progress.setValue(1 if code == 0 else 0)
-        self.status.setText("Done" if code == 0 else "Stopped / failed")
-        self.win.log(f"{label} finished (exit code {code})", "OK" if code == 0 else "WARN")
+        self._tick.stop()
+        took = fmt_duration(time.monotonic() - self._job_t0)
+        self.status.setText(f"Done in {took}" if code == 0 else f"Stopped / failed after {took}")
+        self.win.log(f"{label} finished after {took} (exit code {code})", "OK" if code == 0 else "WARN")
         self.win.refresh(force=True)    # image paths in the database may have changed
         self._update_buttons()
 
@@ -764,7 +802,10 @@ class MainWindow(QMainWindow):
         self.proc = None
         self.target_n = 0
         self.db = LabelDB()
+        self._grid_stale = False
         self._rev, self._last_refresh, self._shown = -1, 0.0, None
+        self._t0, self._done = time.monotonic(), 0
+        self._tick = QTimer(self); self._tick.timeout.connect(self._tick_status)
 
         # ---- labeling controls ----
         self.n = QSpinBox(); self.n.setRange(1, 200000); self.n.setValue(100)
@@ -790,9 +831,11 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setShortcut("F5")
         self.refresh_btn.setToolTip("Reload labels from disk (F5)")
         self.refresh_btn.clicked.connect(lambda: self.refresh(force=True))
-        self.auto_chk = QCheckBox("Auto refresh")
+        self.auto_chk = QCheckBox("Auto refresh images")
         self.auto_chk.setChecked(True)
-        self.auto_chk.setToolTip("Update automatically when the label database changes (e.g. a labeling run).")
+        self.auto_chk.setToolTip("Only affects the image grids (Verified / Discarded). Statistics, counts and the "
+                                 "progress bars always update by themselves.")
+        self.auto_chk.toggled.connect(lambda on: on and self._grid_stale and self.refresh())
         self.poll = QTimer(self); self.poll.timeout.connect(self._poll); self.poll.start(1000)
 
         # ---- pages (tab bar hidden; the sidebar is the navigation) ----
@@ -920,20 +963,28 @@ class MainWindow(QMainWindow):
     # ---- data ----
     def _poll(self):
         """Cheap check (one tiny SQL query); only refreshes when a writer committed something new."""
-        if not self.auto_chk.isChecked() or time.monotonic() - self._last_refresh < 1.0:
+        if time.monotonic() - self._last_refresh < 1.0:
             return
         if self.db.rev() != self._rev:
-            self.refresh()
+            self.refresh(grids=self.auto_chk.isChecked())      # stats / counts always; image grids only if enabled
 
     def _gallery(self):
         w = self.tabs.currentWidget()
         return w if isinstance(w, Gallery) else self.kept
 
-    def refresh(self, force: bool = False):
-        """Update everything from the database. Galleries update in place (selection/scroll survive)."""
+    def refresh(self, force: bool = False, grids: bool = True):
+        """Update from the database. Statistics, counts and progress bars always update; the image grids
+        only when `grids` (auto-refresh on) or `force` (Refresh button). Grids update in place."""
         self._rev = self.db.rev()
         self._last_refresh = time.monotonic()
-        self.kept.refresh(force=force); self.disc.refresh(force=force)
+        if grids or force:
+            self.kept.refresh(force=force); self.disc.refresh(force=force)
+            self._grid_stale = False
+        else:
+            self._grid_stale = True
+        self.refresh_btn.setText("⟳  Refresh  •" if self._grid_stale else "⟳  Refresh")
+        self.refresh_btn.setToolTip("Reload the image grids from the database (F5)" +
+                                    ("\nThe grids are out of date." if self._grid_stale else ""))
         self.stats.update_data(self.db)
         if isinstance(self.tabs.currentWidget(), DupTab) or (force and self.dups.loaded):
             self.dups.reload()
@@ -972,6 +1023,8 @@ class MainWindow(QMainWindow):
         self.proc.readyReadStandardOutput.connect(self.on_output)
         self.proc.finished.connect(self.on_finished)
         self.target_n = self.n.value()
+        self._t0, self._done = time.monotonic(), 0
+        self._tick.start(1000)
         self.progress.setRange(0, self.target_n); self.progress.setValue(0)
         self.status.setText("Running…")
         self.set_running(True)
@@ -990,8 +1043,13 @@ class MainWindow(QMainWindow):
             if line.strip():
                 self.log(line, "ERROR" if ("Traceback" in line or "Error" in line) else "PROC")
             if "/" in line and line.split("/")[0].strip().isdigit():
-                self.progress.setValue(int(line.split("/")[0]))
-                self.status.setText(f"{line.strip()} images")
+                self._done = int(line.split("/")[0])
+                self.progress.setValue(self._done)
+                self._tick_status()
+
+    def _tick_status(self):
+        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
+            self.status.setText(progress_text(self._done, self.target_n, self._t0, " images"))
 
     def stop_run(self):
         if self.proc:
@@ -1001,8 +1059,10 @@ class MainWindow(QMainWindow):
 
     def on_finished(self, code, _status):
         self.set_running(False)
-        self.status.setText("Done" if code == 0 else "Stopped (results so far are kept)")
-        self.log(f"Labeling process finished (exit code {code})", "OK" if code == 0 else "WARN")
+        self._tick.stop()
+        took = fmt_duration(time.monotonic() - self._t0)
+        self.status.setText(f"Done in {took}" if code == 0 else f"Stopped after {took} (results so far are kept)")
+        self.log(f"Labeling process finished after {took} (exit code {code})", "OK" if code == 0 else "WARN")
         if code == 0:
             self.progress.setValue(self.target_n)
         self.refresh(force=True)
