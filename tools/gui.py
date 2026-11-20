@@ -831,6 +831,11 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setShortcut("F5")
         self.refresh_btn.setToolTip("Reload labels from disk (F5)")
         self.refresh_btn.clicked.connect(lambda: self.refresh(force=True))
+        self.scan_btn = QPushButton("Scan new images")
+        self.scan_btn.setToolTip("Find images you added to data/raw/ and register them as unlabeled.\n"
+                                 "Fast: only folders that changed since the last scan are re-listed.")
+        self.scan_btn.clicked.connect(self.scan_new)
+        self.scan_proc = None
         self.auto_chk = QCheckBox("Auto refresh images")
         self.auto_chk.setChecked(True)
         self.auto_chk.setToolTip("Only affects the image grids (Verified / Discarded). Statistics, counts and the "
@@ -878,7 +883,8 @@ class MainWindow(QMainWindow):
         opts = self.opts = QHBoxLayout(); opts.setSpacing(8)
         for label, w in (("Images", self.n), ("Seed", self.seed), ("Workers", self.workers)):
             lab = QLabel(label); lab.setObjectName("muted"); opts.addWidget(lab); opts.addWidget(w); opts.addSpacing(8)
-        opts.addWidget(self.move_chk); opts.addStretch(); opts.addWidget(self.auto_chk); opts.addWidget(self.refresh_btn)
+        opts.addWidget(self.move_chk); opts.addStretch(); opts.addWidget(self.auto_chk)
+        opts.addWidget(self.scan_btn); opts.addWidget(self.refresh_btn)
         prow = self.prow = QHBoxLayout(); prow.addWidget(self.progress, 1); prow.addWidget(self.status)
 
         # ---- detail panel ----
@@ -930,7 +936,7 @@ class MainWindow(QMainWindow):
         on_dups = i == 3                      # labeling controls are irrelevant there
         if on_dups and not self.dups.loaded:
             self.dups.reload()
-        keep = (self.auto_chk, self.refresh_btn)
+        keep = (self.auto_chk, self.refresh_btn, self.scan_btn)
         for k in range(self.opts.count()):
             w = self.opts.itemAt(k).widget()
             if w is not None and w not in keep:
@@ -999,6 +1005,31 @@ class MainWindow(QMainWindow):
         if force:
             self.log(f"Refreshed: {t['labeled']:,} labeled ({t['kept']:,} kept, {t['discarded']:,} discarded), "
                      f"{t['failed']:,} failed, {t['unlabeled']:,} unlabeled")
+
+    # ---- scan for new images ----
+    def scan_new(self):
+        if self.scan_proc and self.scan_proc.state() != QProcess.ProcessState.NotRunning:
+            return
+        self.scan_btn.setEnabled(False)
+        self.status.setText("Scanning data/raw/ …")
+        self.log("Scanning data/raw/ for new images")
+        self.scan_proc = QProcess(self)
+        self.scan_proc.setWorkingDirectory(str(REPO))
+        self.scan_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.scan_proc.readyReadStandardOutput.connect(self._scan_output)
+        self.scan_proc.finished.connect(self._scan_finished)
+        self.scan_proc.start(sys.executable, ["-u", "tools/scan.py"])
+
+    def _scan_output(self):
+        for line in bytes(self.scan_proc.readAllStandardOutput()).decode(errors="replace").splitlines():
+            if line.strip():
+                self.log(line.strip(), "ERROR" if ("Traceback" in line or "Error" in line) else "PROC")
+
+    def _scan_finished(self, code, _status):
+        self.scan_btn.setEnabled(True)
+        self.status.setText("Scan finished" if code == 0 else "Scan failed (see console)")
+        self.log("Scan finished" if code == 0 else f"Scan failed (exit code {code})", "OK" if code == 0 else "ERROR")
+        self.refresh(force=True)
 
     # ---- labeling process ----
     def start_run(self):

@@ -9,6 +9,7 @@ themselves stay in data/. CSV copies can be written any time with:  python tools
   python tools/labeldb.py stats
 """
 import csv
+import json
 import os
 import sqlite3
 import sys
@@ -35,6 +36,8 @@ CREATE TABLE IF NOT EXISTS dups(
   group_id INTEGER, image TEXT, keeper INTEGER, score REAL, finder TEXT, status TEXT,
   moved_to TEXT, width INTEGER, height INTEGER, bytes INTEGER, PRIMARY KEY(group_id, image));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER);
+CREATE TABLE IF NOT EXISTS scan_state(      -- folder mtimes seen by tools/scan.py (lets a rescan skip unchanged folders)
+  dir TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, subdirs TEXT NOT NULL);
 INSERT OR IGNORE INTO meta VALUES('rev', 0);
 INSERT OR IGNORE INTO meta VALUES('seq', 0);
 """
@@ -76,6 +79,22 @@ class LabelDB:
             c.executemany(
                 "INSERT OR IGNORE INTO images(path,loc,source,legacy_path,legacy_task,legacy_split,legacy_label)"
                 " VALUES(:path,:loc,:source,:legacy_path,:legacy_task,:legacy_split,:legacy_label)", list(rows))
+
+    def known_paths(self, loc: str = "raw") -> set:
+        return {r[0] for r in self.c.execute("SELECT path FROM images WHERE loc=?", (loc,))}
+
+    def scan_state(self) -> Dict[str, tuple]:
+        return {r[0]: (r[1], json.loads(r[2])) for r in self.c.execute("SELECT dir, mtime_ns, subdirs FROM scan_state")}
+
+    def scan_commit(self, new_rows: List[Dict], state: Dict[str, tuple]) -> None:
+        """Insert newly found images and remember the folder mtimes in ONE transaction."""
+        with self.tx() as c:
+            if new_rows:
+                c.executemany(
+                    "INSERT OR IGNORE INTO images(path,loc,source,legacy_path,legacy_task,legacy_split,legacy_label)"
+                    " VALUES(:path,:loc,:source,:legacy_path,:legacy_task,:legacy_split,:legacy_label)", new_rows)
+            c.executemany("INSERT OR REPLACE INTO scan_state VALUES(?,?,?)",
+                          [(d, m, json.dumps(s)) for d, (m, s) in state.items()])
 
     def candidates(self, loc: str = "raw", only_unlabeled: bool = True) -> List[str]:
         q = "SELECT path FROM images WHERE loc=?" + (" AND (valid IS NULL OR valid=0)" if only_unlabeled else "")

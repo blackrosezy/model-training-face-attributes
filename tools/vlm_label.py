@@ -22,12 +22,15 @@ CLASSES = yaml.safe_load((ROOT / "configs/classes.yaml").read_text())
 OVERLAY = ["none", "text", "logo_brand", "watermark"]
 
 PROMPT = (
-    "Look at this image of a face.\n"
-    "1. Classify the person's age group, emotion and gender.\n"
-    "2. Check whether the image has any overlay added on top of the photo: visible text, captions, "
-    "a logo or brand name, a watermark, stamps or UI elements. Answer \"none\" if the photo is clean.\n"
-    "Reply with ONLY a JSON object, no other text:\n"
-    + json.dumps({**{t: "one of " + json.dumps(c) for t, c in CLASSES.items()},
+    "Look at this image of a face. FIRST inspect it for any overlay that was ADDED ON TOP of the photo after it was taken: "
+    "a watermark (even faint/semi-transparent, e.g. stock-photo names), a logo or brand name stamped "
+    "on the image, or text/captions/subtitles.\n"
+    "Do NOT count things that were physically part of the photographed scene, such as lettering or "
+    "logos on clothing, hats, signs, badges or products.\n"
+    "Then classify age, emotion, gender.\n"
+    "Reply with ONLY a JSON object, keys in this order:\n"
+    + json.dumps({"overlay_evidence": "short description of any added watermark/logo/text and where, or 'nothing'",
+                  **{t: "one of " + json.dumps(c) for t, c in CLASSES.items()},
                   "overlay": "one of " + json.dumps(OVERLAY)}, indent=1)
 )
 
