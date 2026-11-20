@@ -1,24 +1,25 @@
 """Label images with the Unsloth VLM and discard images with text/brand overlays, in one pass.
 
-Legacy folder labels are never used. Resumable; appends to data/labels/vlm_labels.csv.
+Legacy folder labels are never used. Resumable; results go to the label database (tools/labeldb.py).
 Images flagged with an overlay are moved from data/raw/<src>/ to data/discarded/<src>/
-and master.csv is updated to the new path.
+and the database is updated to the new path.
 
 Usage: python tools/vlm_label.py --n 100 [--seed 0] [--workers 4] [--no-move]
 Env: UNSLOTH_BASE_URL, UNSLOTH_API_KEY (from .env)
 """
-import argparse, base64, csv, json, os, random, re, shutil
+import argparse, base64, json, os, random, re, shutil, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import yaml
 from openai import OpenAI
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from labeldb import LabelDB
+
 ROOT = Path("data")
 MODEL = "unsloth/Qwen3.5-9B-GGUF"
 CLASSES = yaml.safe_load((ROOT / "configs/classes.yaml").read_text())
 OVERLAY = ["none", "text", "logo_brand", "watermark"]
-OUT = ROOT / "labels" / "vlm_labels.csv"
-FIELDS = ["image", "vlm_age", "vlm_emotion", "vlm_gender", "vlm_overlay", "valid", "raw"]
 
 PROMPT = (
     "Look at this image of a face.\n"
@@ -46,16 +47,11 @@ def label(rel: str) -> dict:
         raw = r.choices[0].message.content or ""
         d = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
     except Exception as e:
-        return {"image": rel, "vlm_age": "", "vlm_emotion": "", "vlm_gender": "", "vlm_overlay": "",
+        return {"path": rel, "age": None, "emotion": None, "gender": None, "overlay": None,
                 "valid": 0, "raw": f"ERR {type(e).__name__}: {e} | {raw}"[:500]}
     ok = all(d.get(t) in CLASSES[t] for t in CLASSES) and d.get("overlay") in OVERLAY
-    return {"image": rel, "vlm_age": d.get("age"), "vlm_emotion": d.get("emotion"),
-            "vlm_gender": d.get("gender"), "vlm_overlay": d.get("overlay"), "valid": int(ok),
-            "raw": raw.replace("\n", " ")[:500]}
-
-def write_csv(path, rows, fields):
-    with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
+    return {"path": rel, "age": d.get("age"), "emotion": d.get("emotion"), "gender": d.get("gender"),
+            "overlay": d.get("overlay"), "valid": int(ok), "raw": raw.replace("\n", " ")[:500]}
 
 def main():
     ap = argparse.ArgumentParser()
@@ -65,41 +61,34 @@ def main():
     ap.add_argument("--no-move", action="store_true")
     a = ap.parse_args()
 
-    with (ROOT / "labels/master.csv").open() as f:
-        images = [r["image"] for r in csv.DictReader(f) if r["image"].startswith("raw/")]
-    done = set()
-    if OUT.exists():
-        with OUT.open() as f:
-            done = {r["image"] for r in csv.DictReader(f) if r["valid"] == "1"}
-    random.Random(a.seed).shuffle(images)
-    todo = [i for i in images if i not in done][: a.n]
+    db = LabelDB()
+    todo = db.candidates("raw", only_unlabeled=True)          # raw/ images that are not labeled yet
+    random.Random(a.seed).shuffle(todo)
+    todo = todo[: a.n]
 
-    results = []
-    new = not OUT.exists()
-    with OUT.open("a", newline="") as f, ThreadPoolExecutor(a.workers) as ex:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
-        if new: w.writeheader()
+    results, batch = [], []
+    with ThreadPoolExecutor(a.workers) as ex:
         for i, row in enumerate(ex.map(label, todo), 1):
-            w.writerow(row); f.flush(); results.append(row)
+            results.append(row); batch.append(row)
+            if len(batch) >= 5:                                 # small batches: live in the GUI, cheap on the DB
+                db.set_labels(batch); batch = []
             if i % 10 == 0: print(f"{i}/{len(todo)}", flush=True)
+    if batch:
+        db.set_labels(batch)
 
-    flagged = [r for r in results if r["valid"] == 1 and r["vlm_overlay"] != "none"]
+    flagged = [r for r in results if r["valid"] == 1 and r["overlay"] != "none"]
     print(f"labeled {len(results)}, invalid {sum(r['valid']==0 for r in results)}, "
           f"overlay-flagged {len(flagged)}")
     if a.no_move or not flagged:
         return
     moved = {}
     for r in flagged:
-        new_rel = "discarded/" + r["image"].split("/", 1)[1]      # raw/<src>/x -> discarded/<src>/x
+        new_rel = "discarded/" + r["path"].split("/", 1)[1]      # raw/<src>/x -> discarded/<src>/x
         dst = ROOT / new_rel; dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(ROOT / r["image"], dst); moved[r["image"]] = new_rel
-    mrows = list(csv.DictReader((ROOT / "labels/master.csv").open()))
-    for r in mrows: r["image"] = moved.get(r["image"], r["image"])
-    write_csv(ROOT / "labels/master.csv", mrows, list(mrows[0]))
-    vrows = list(csv.DictReader(OUT.open()))
-    for r in vrows: r["image"] = moved.get(r["image"], r["image"])
-    write_csv(OUT, vrows, FIELDS)
+        shutil.move(ROOT / r["path"], dst); moved[r["path"]] = new_rel
+    db.move_paths(moved)
     print(f"moved {len(moved)} images to data/discarded/")
+
 
 if __name__ == "__main__":
     main()

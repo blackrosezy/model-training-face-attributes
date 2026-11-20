@@ -22,3 +22,12 @@ r = c.chat.completions.create(model="unsloth/Qwen3.5-9B-GGUF",
 print(r.choices[0].message.content)
 ```
 Load env first: `set -a; source .env; set +a`.
+
+## Labels, GUI and dedup (tools/)
+- **Label store is SQLite**, not CSV: `~/.local/share/face-labeling/labels.db` (override: env `FACE_LABELS_DB`). It must stay on the
+  WSL ext4 disk - SQLite on `/mnt/d` is ~200x slower. Images stay in `data/raw/` and `data/discarded/` (on `/mnt/d`).
+  Old CSVs are in `data/labels/csv_backup/`. `python tools/labeldb.py stats|export|migrate`.
+- GUI thumbnail cache: `~/.cache/face-labeling/thumbs/` (safe to delete). Run the GUI with `./run_gui.sh`.
+- Duplicate detection: `tools/dedup/` (pluggable finders, see its README). GUI offers `torch_gpu` only; `faiss_embed` is hidden but kept.
+  `python tools/dedup_cli.py find|apply|restore|list`.
+- Bulk file moves on `/mnt/d` from WSL are slow (~4k files/min); native Windows `powershell.exe` renames are ~1k files/s.

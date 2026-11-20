@@ -3,30 +3,32 @@
 Run from anywhere:  python tools/gui.py
 Needs UNSLOTH_BASE_URL / UNSLOTH_API_KEY in .env (same as the CLI).
 """
-import csv, html, os, shutil, sys, traceback
+import hashlib, html, os, shutil, sys, time, traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import yaml
-from PyQt6.QtCore import QProcess, QProcessEnvironment, QSize, Qt, QTimer, QUrl
-from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImageReader, QPainter, QPalette, QPixmap
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # so `import dedup` works from anywhere
+from dedup import registry as dedup_registry, store as dedup_store
+from labeldb import LabelDB
+from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QImageReader, QPainter, QPalette, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QGridLayout, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QApplication, QSizePolicy, QCheckBox, QDoubleSpinBox, QGridLayout, QComboBox, QLineEdit, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
     QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
-VLM_CSV = DATA / "labels" / "vlm_labels.csv"
-MASTER_CSV = DATA / "labels" / "master.csv"
 CLASSES = yaml.safe_load((DATA / "configs" / "classes.yaml").read_text())
 OVERLAYS = ["text", "logo_brand", "watermark"]
 PAGE = 120
 LOG_FILE = REPO / "gui.log"
 LOG_COLORS = {"INFO": "#222", "OK": "#1b7a2b", "WARN": "#b26a00", "ERROR": "#c62828", "PROC": "#555"}
 THUMB = 150
+THUMB_CACHE = Path.home() / ".cache" / "face-labeling" / "thumbs"     # fast WSL disk, not /mnt/d
 
 ASSETS = (REPO / "tools" / "assets").as_posix()
 ACCENT = "#0078d7"
@@ -71,16 +73,16 @@ QPushButton#safe:hover { background: #eef6fd; }
 QPushButton#safe:disabled { border: 1px solid #e0e0e0; color: #a0a0a0; background: #f7f7f7; }
 
 /* inputs */
-QComboBox, QSpinBox { background: white; border: 1px solid #8a8a8a; padding: 4px 8px; min-height: 20px; }
-QComboBox:hover, QSpinBox:hover { border-color: #333; }
-QComboBox:focus, QSpinBox:focus { border-color: #0078d7; }
+QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit { background: white; border: 1px solid #8a8a8a; padding: 4px 8px; min-height: 20px; }
+QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QLineEdit:hover { border-color: #333; }
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus { border-color: #0078d7; }
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow { image: url("ASSETS/chevron-down.svg"); width: 10px; height: 10px; }
 QComboBox QAbstractItemView { background: white; border: 1px solid #8a8a8a; outline: 0;
     selection-background-color: #cce4f7; selection-color: #000; }
-QSpinBox::up-button, QSpinBox::down-button { width: 18px; border: none; background: transparent; }
-QSpinBox::up-arrow { image: url("ASSETS/chevron-up.svg"); width: 8px; height: 8px; }
-QSpinBox::down-arrow { image: url("ASSETS/chevron-down.svg"); width: 8px; height: 8px; }
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 18px; border: none; background: transparent; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url("ASSETS/chevron-up.svg"); width: 8px; height: 8px; }
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: url("ASSETS/chevron-down.svg"); width: 8px; height: 8px; }
 QCheckBox { spacing: 8px; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #333; background: white; }
 QCheckBox::indicator:hover { border-color: #0078d7; }
@@ -146,52 +148,152 @@ def load_pixmap(path: Path, size: int) -> QPixmap:
     return QPixmap() if img.isNull() else QPixmap.fromImage(img)
 
 
-def read_rows(path: Path) -> list:
-    if not path.exists():
-        return []
-    with path.open(newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def rewrite_paths(path: Path, mapping: dict) -> None:
-    rows = read_rows(path)
-    if not rows:
-        return
-    for r in rows:
-        r["image"] = mapping.get(r["image"], r["image"])
-    with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-
-
 def short_label(r: dict) -> str:
-    g = {"female": "F", "male": "M"}.get(r["vlm_gender"], "?")
-    return f"{r['vlm_age']} · {r['vlm_emotion']} · {g}"
+    g = {"female": "F", "male": "M"}.get(r["gender"], "?")
+    return f"{r['age']} · {r['emotion']} · {g}"
+
+
+# ---------------------------------------------------------------------------------------------
+# Thumbnails: loaded by a thread pool, cached on the fast WSL disk, so the window never waits.
+# ---------------------------------------------------------------------------------------------
+def thumb_path(rel: str, size: int) -> Path:
+    stable = rel.split("/", 1)[1] if "/" in rel else rel          # same cache entry in raw/ and discarded/
+    h = hashlib.sha1(f"{stable}|{size}".encode()).hexdigest()
+    return THUMB_CACHE / h[:2] / f"{h}.jpg"
+
+
+def make_thumb(rel: str, size: int) -> QImage:
+    cached = thumb_path(rel, size)
+    if cached.exists():
+        img = QImage(str(cached))
+        if not img.isNull():
+            return img
+    r = QImageReader(str(DATA / rel))
+    r.setAutoTransform(True)
+    s = r.size()
+    if s.isValid():
+        s.scale(size, size, Qt.AspectRatioMode.KeepAspectRatio)
+        r.setScaledSize(s)
+    img = r.read()
+    if not img.isNull():
+        try:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            img.convertToFormat(QImage.Format.Format_RGB32).save(str(cached), "JPEG", 88)
+        except OSError:
+            pass
+    return img
+
+
+class Batch:
+    """Lets a page cancel all its still-queued thumbnail jobs when the user moves on."""
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _Signals(QObject):
+    done = pyqtSignal(str, int, QImage)
+
+
+class _Task(QRunnable):
+    def __init__(self, rel, size, batch, sig):
+        super().__init__()
+        self.rel, self.size, self.batch, self.sig = rel, size, batch, sig
+
+    def run(self):
+        if self.batch.cancelled:
+            return
+        try:
+            img = make_thumb(self.rel, self.size)
+        except Exception:
+            img = QImage()
+        self.sig.done.emit(self.rel, self.size, img)
+
+
+class ThumbLoader:
+    def __init__(self):
+        self.pool = QThreadPool()
+        self.pool.setMaxThreadCount(8)
+        self.sig = _Signals()
+
+    def request(self, rel: str, size: int, batch: Batch):
+        self.pool.start(_Task(rel, size, batch, self.sig))
+
+
+_loader = None
+
+
+def thumbs() -> ThumbLoader:
+    global _loader
+    if _loader is None:
+        _loader = ThumbLoader()
+    return _loader
+
+
+_placeholder = {}
+
+
+def placeholder(size: int) -> QIcon:
+    if size not in _placeholder:
+        pm = QPixmap(size, size)
+        pm.fill(QColor("#ececec"))
+        _placeholder[size] = QIcon(pm)
+    return _placeholder[size]
+
+
+class PreviewLabel(QLabel):
+    """Shows one image scaled to whatever space is available (re-scales when the window is resized)."""
+
+    def __init__(self, text: str):
+        super().__init__(text)
+        self._pm = QPixmap()
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(200, 160)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_image(self, pm: QPixmap):
+        self._pm = pm
+        self._fit()
+
+    def clear_image(self, text: str):
+        self._pm = QPixmap()
+        self.setPixmap(QPixmap())
+        self.setText(text)
+
+    def _fit(self):
+        if not self._pm.isNull():
+            self.setPixmap(self._pm.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit()
+
+    def sizeHint(self):
+        return QSize(340, 340)
 
 
 class Gallery(QWidget):
-    """Filterable, paged thumbnail grid for one folder (raw = kept, discarded)."""
+    """Filterable, paged thumbnail grid for one location (raw = kept, discarded). Data comes from SQLite."""
 
-    def __init__(self, prefix: str, on_select):
+    def __init__(self, loc: str, win):
         super().__init__()
-        self.prefix, self.on_select = prefix, on_select
-        self.rows, self.filtered, self.page = [], [], 0
-        self._queue, self._timer = [], QTimer(self)
-        self._timer.timeout.connect(self._load_chunk)
+        self.loc, self.win = loc, win
+        self.page, self.items, self.batch, self._last, self._quiet = 0, {}, None, None, False
 
         self.f_age, self.f_emo, self.f_gen = (QComboBox() for _ in range(3))
         for box, key in ((self.f_age, "age"), (self.f_emo, "emotion"), (self.f_gen, "gender")):
             box.addItems(["All"] + CLASSES[key])
-        self.f_src = QComboBox()
-        self.f_ovl = QComboBox()
-        self.f_ovl.addItems(["All"] + OVERLAYS)
+        self.f_src = QComboBox(); self.f_src.addItem("All")
+        self.f_ovl = QComboBox(); self.f_ovl.addItems(["All"] + OVERLAYS)
         for box in (self.f_age, self.f_emo, self.f_gen, self.f_src, self.f_ovl):
             box.currentIndexChanged.connect(self._filters_changed)
 
         top = QHBoxLayout()
         pairs = [("Age", self.f_age), ("Emotion", self.f_emo), ("Gender", self.f_gen), ("Source", self.f_src)]
-        if prefix == "discarded":
+        if loc == "discarded":
             pairs.append(("Overlay", self.f_ovl))
         for text, box in pairs:
             top.addWidget(QLabel(text)); top.addWidget(box)
@@ -202,10 +304,10 @@ class Gallery(QWidget):
         self.grid.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.grid.setMovement(QListWidget.Movement.Static)
         self.grid.setIconSize(QSize(THUMB, THUMB))
-        self.grid.setGridSize(QSize(THUMB + 24, THUMB + 42))
+        self.grid.setGridSize(QSize(THUMB + 46, THUMB + 42))
         self.grid.setWordWrap(True)
         self.grid.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.grid.itemSelectionChanged.connect(lambda: self.on_select(self))
+        self.grid.itemSelectionChanged.connect(self._sel_changed)
 
         self.prev, self.next = QPushButton("◀ Prev"), QPushButton("Next ▶")
         self.prev.clicked.connect(lambda: self._go(-1))
@@ -217,77 +319,101 @@ class Gallery(QWidget):
 
         lay = QVBoxLayout(self)
         lay.addLayout(top); lay.addWidget(self.grid, 1); lay.addLayout(bottom)
+        thumbs().sig.done.connect(self._thumb_ready)
 
-    # -- data -----------------------------------------------------------
-    def set_rows(self, all_rows: list):
-        self.rows = [r for r in all_rows if r["valid"] == "1" and r["image"].startswith(self.prefix + "/")]
-        sources = sorted({r["image"].split("/")[1] for r in self.rows})
-        cur = self.f_src.currentText()
-        self.f_src.blockSignals(True)
-        self.f_src.clear(); self.f_src.addItems(["All"] + sources)
-        if cur in sources:
-            self.f_src.setCurrentText(cur)
-        self.f_src.blockSignals(False)
-        self._apply()
+    # ---- filters / paging ----
+    def filters(self) -> dict:
+        return {"age": self.f_age.currentText(), "emotion": self.f_emo.currentText(),
+                "gender": self.f_gen.currentText(), "source": self.f_src.currentText(),
+                "overlay": self.f_ovl.currentText()}
 
     def _filters_changed(self):
         self.page = 0
-        self._apply()
-
-    def _apply(self):
-        def ok(r):
-            return ((self.f_age.currentText() in ("All", r["vlm_age"]))
-                    and (self.f_emo.currentText() in ("All", r["vlm_emotion"]))
-                    and (self.f_gen.currentText() in ("All", r["vlm_gender"]))
-                    and (self.f_src.currentText() in ("All", r["image"].split("/")[1]))
-                    and (self.f_ovl.currentText() in ("All", r["vlm_overlay"])))
-        self.filtered = [r for r in self.rows if ok(r)]
-        self.page = min(self.page, max(0, (len(self.filtered) - 1) // PAGE))
-        self._show_page()
+        self.refresh(force=True)
 
     def _go(self, d):
         self.page += d
-        self._show_page()
+        self.refresh(force=True)
 
-    def _show_page(self):
-        self._timer.stop()
-        self.grid.clear()
-        chunk = self.filtered[self.page * PAGE:(self.page + 1) * PAGE]
-        blank = QIcon(QPixmap(THUMB, THUMB))
-        self._queue = []
-        for r in chunk:
-            it = QListWidgetItem(blank, short_label(r))
-            it.setData(Qt.ItemDataRole.UserRole, r)
-            it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-            self.grid.addItem(it)
-            self._queue.append(it)
-        pages = max(1, -(-len(self.filtered) // PAGE))
-        self.info.setText(f"{len(self.filtered):,} images  ·  page {self.page + 1} / {pages}")
+    def _sel_changed(self):
+        if not self._quiet:
+            self.win.show_detail(self)
+
+    def _sync_sources(self):
+        names = ["All"] + self.win.db.sources(self.loc)
+        if names != [self.f_src.itemText(i) for i in range(self.f_src.count())]:
+            cur = self.f_src.currentText()
+            self.f_src.blockSignals(True)
+            self.f_src.clear(); self.f_src.addItems(names)
+            if cur in names:
+                self.f_src.setCurrentText(cur)
+            self.f_src.blockSignals(False)
+
+    # ---- data: SQL query for ONE page; in-place update so scroll position and selection survive ----
+    def refresh(self, force: bool = False):
+        db = self.win.db
+        self._sync_sources()
+        f = self.filters()
+        total = db.count(self.loc, f)
+        pages = max(1, -(-total // PAGE))
+        self.page = min(self.page, pages - 1)
+        rows = db.page(self.loc, f, PAGE, self.page * PAGE)
+        key = (tuple(sorted(f.items())), self.page)
+        self._quiet = True
+        self.grid.setUpdatesEnabled(False)
+        try:
+            if force or key != self._last:
+                self._rebuild(rows)
+            else:
+                self._diff(rows)
+        finally:
+            self.grid.setUpdatesEnabled(True)
+            self._quiet = False
+        self._last = key
+        self.info.setText(f"{total:,} images  ·  page {self.page + 1} / {pages}")
         self.prev.setEnabled(self.page > 0)
         self.next.setEnabled(self.page + 1 < pages)
-        self._timer.start(0)
+        self._sel_changed()
 
-    def _load_chunk(self):
-        for _ in range(8):
-            if not self._queue:
-                self._timer.stop(); return
-            it = self._queue.pop(0)
-            try:
-                r = it.data(Qt.ItemDataRole.UserRole)
-                pm = load_pixmap(DATA / r["image"], THUMB)
-                if not pm.isNull():
-                    it.setIcon(QIcon(pm))
-            except RuntimeError:  # item deleted meanwhile
-                self._queue.clear(); return
+    def _add(self, r: dict):
+        it = QListWidgetItem(placeholder(THUMB), short_label(r))
+        it.setData(Qt.ItemDataRole.UserRole, r)
+        it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.grid.addItem(it)
+        self.items[r["path"]] = it
+        thumbs().request(r["path"], THUMB, self.batch)
+
+    def _rebuild(self, rows):
+        if self.batch:
+            self.batch.cancel()
+        self.batch = Batch()
+        self.grid.clear(); self.items = {}
+        for r in rows:
+            self._add(r)
+
+    def _diff(self, rows):
+        new = {r["path"] for r in rows}
+        for path in [p for p in self.items if p not in new]:     # moved away / relabeled
+            self.grid.takeItem(self.grid.row(self.items.pop(path)))
+        for r in rows:                                           # freshly labeled images are appended
+            if r["path"] not in self.items:
+                self._add(r)
+
+    def _thumb_ready(self, rel: str, size: int, img: QImage):
+        it = self.items.get(rel)
+        if it is None or size != THUMB or img.isNull():
+            return
+        try:
+            it.setIcon(QIcon(QPixmap.fromImage(img)))
+        except RuntimeError:                                     # item deleted meanwhile
+            pass
 
     def selected(self) -> list:
         return [i.data(Qt.ItemDataRole.UserRole) for i in self.grid.selectedItems()]
 
-    def select_paths(self, paths: set):
-        for i in range(self.grid.count()):
-            it = self.grid.item(i)
-            if it.data(Qt.ItemDataRole.UserRole)["image"] in paths:
-                it.setSelected(True)
+    def shutdown(self):
+        if self.batch:
+            self.batch.cancel()
 
 
 class BarChart(QWidget):
@@ -362,38 +488,283 @@ class StatsTab(QWidget):
 
         lay = QVBoxLayout(self)
         lay.addLayout(head); lay.addLayout(cards); lay.addLayout(grid); lay.addStretch()
-        self.rows, self.total = [], 0
+        self.db = None
 
-    def update_data(self, rows: list, total: int):
-        self.rows, self.total = rows, total
+    def update_data(self, db):
+        self.db = db
         self._redraw()
 
     def _redraw(self):
-        ok = [r for r in self.rows if r["valid"] == "1"]
-        kept = [r for r in ok if r["image"].startswith("raw/")]
-        disc = [r for r in ok if r["image"].startswith("discarded/")]
-        for key, val in (("Total images", self.total), ("Labeled", len(ok)), ("Kept", len(kept)),
-                         ("Discarded", len(disc)), ("Failed / invalid", len(self.rows) - len(ok)),
-                         ("Unlabeled", max(0, self.total - len(ok)))):
+        db, t = self.db, self.db.totals()
+        for key, val in (("Total images", t["total"]), ("Labeled", t["labeled"]), ("Kept", t["kept"]),
+                         ("Discarded", t["discarded"]), ("Failed / invalid", t["failed"]),
+                         ("Unlabeled", t["unlabeled"])):
             self.cards[key].setText(f"{val:,}")
-        use = kept if self.scope.currentIndex() == 0 else ok
+        kept_only = self.scope.currentIndex() == 0
         for key, chart in self.charts.items():
-            rows = ok if key == "overlay" else use  # overlay images are never in "kept"
-            chart.set_counts(Counter(r.get("vlm_" + key, "") for r in rows))
-        self.updated.setText(f"updated {datetime.now().strftime('%H:%M:%S')}  ·  {len(use):,} images counted")
+            chart.set_counts(db.distribution(key, kept_only and key != "overlay"))   # overlay images are never "kept"
+        counted = t["kept"] if kept_only else t["labeled"]
+        self.updated.setText(f"updated {datetime.now().strftime('%H:%M:%S')}  ·  {counted:,} images counted")
+
+
+class DupTab(QWidget):
+    """Find near-duplicate images (pluggable back-end), review the groups, keep 1 per group."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win, self.proc, self.groups = win, None, {}
+        self.pending_remove = self.n_moved = 0
+        self.widgets, self._titems, self._tbatch = {}, {}, None
+
+        self.finder = QComboBox()
+        offered = {n: c for n, c in dedup_registry.available().items() if not c.hidden}
+        for i, (name, cls) in enumerate(offered.items()):
+            self.finder.addItem(name, name)
+            miss = cls.missing_requirements()
+            tip = cls.description + (f"\nMissing: {', '.join(miss)}. {cls.install_hint}" if miss else "")
+            self.finder.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
+            if miss:
+                self.finder.model().item(i).setEnabled(False)
+        self.finder.currentIndexChanged.connect(self._build_params)
+        self.param_box = QHBoxLayout(); self.param_box.setSpacing(8)
+        self.limit = QSpinBox(); self.limit.setRange(0, 200000); self.limit.setFixedWidth(92)
+        self.limit.setToolTip("Only look at N random images (0 = all). Handy for a quick test.")
+        self.find_btn = QPushButton("Find duplicates"); self.find_btn.setObjectName("start")
+        self.find_btn.clicked.connect(self.find)
+        self.stop_btn = QPushButton("Stop"); self.stop_btn.setObjectName("stop"); self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(lambda: self.proc and self.proc.kill())
+
+        top = QHBoxLayout(); top.setSpacing(8)
+        lab = QLabel("Method"); lab.setObjectName("muted"); top.addWidget(lab); top.addWidget(self.finder)
+        lab = QLabel("Limit"); lab.setObjectName("muted"); top.addWidget(lab); top.addWidget(self.limit)
+        top.addStretch(); top.addWidget(self.find_btn); top.addWidget(self.stop_btn)
+        self.param_box.addStretch()
+
+        self.summary = QLabel(); self.summary.setObjectName("muted")
+        self.progress = QProgressBar(); self.progress.setTextVisible(False)
+        self.status = QLabel("Idle"); self.status.setObjectName("muted")
+        prow = QHBoxLayout(); prow.addWidget(self.progress, 1); prow.addWidget(self.status)
+
+        self.glist = QListWidget(); self.glist.setFixedWidth(260)
+        self.glist.currentRowChanged.connect(lambda _: self._show_group())
+        self.thumbs = QListWidget()
+        self.thumbs.setViewMode(QListWidget.ViewMode.IconMode)
+        self.thumbs.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.thumbs.setMovement(QListWidget.Movement.Static)
+        self.thumbs.setIconSize(QSize(THUMB + 30, THUMB + 30))
+        self.thumbs.setGridSize(QSize(THUMB + 54, THUMB + 84))
+        self.thumbs.setWordWrap(True)
+        self.thumbs.itemSelectionChanged.connect(self._update_buttons)
+        self.thumbs.itemDoubleClicked.connect(lambda _: self.make_keeper())
+        thumbs().sig.done.connect(self._thumb_ready)
+        body = QSplitter(); body.addWidget(self.glist); body.addWidget(self.thumbs)
+        body.setStretchFactor(1, 1); body.setChildrenCollapsible(False)
+
+        self.keep_btn = QPushButton("Keep this one instead")
+        self.keep_btn.setToolTip("Select an image in the group (or double-click it) to make it the survivor.")
+        self.keep_btn.clicked.connect(self.make_keeper)
+        self.restore_btn = QPushButton("Restore moved duplicates"); self.restore_btn.setObjectName("safe")
+        self.restore_btn.clicked.connect(self.restore)
+        self.apply_btn = QPushButton("Move duplicates to discarded"); self.apply_btn.setObjectName("danger")
+        self.apply_btn.clicked.connect(self.apply)
+        bottom = QHBoxLayout(); bottom.setSpacing(8)
+        bottom.addWidget(self.keep_btn); bottom.addStretch(); bottom.addWidget(self.restore_btn); bottom.addWidget(self.apply_btn)
+
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 8, 0, 0); lay.setSpacing(10)
+        lay.addLayout(top); lay.addLayout(self.param_box); lay.addWidget(self.summary); lay.addLayout(prow)
+        lay.addWidget(body, 1); lay.addLayout(bottom)
+        self._build_params()
+        self.loaded = False                 # the (large) group list is built on first visit
+
+    # ---- method parameters, generated from the finder's declaration ----
+    def _build_params(self):
+        while self.param_box.count() > 1:                    # keep the trailing stretch
+            it = self.param_box.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self.widgets = {}
+        cls = dedup_registry.available().get(self.finder.currentData())
+        if not cls:
+            return
+        for key, spec in cls.params.items():
+            if isinstance(spec.default, float):
+                w = QDoubleSpinBox(); w.setDecimals(3)
+                w.setRange(spec.min if spec.min is not None else 0, spec.max if spec.max is not None else 1e6)
+                w.setSingleStep(spec.step or 0.01); w.setValue(spec.default); w.setFixedWidth(96)
+            elif isinstance(spec.default, int):
+                w = QSpinBox()
+                w.setRange(int(spec.min if spec.min is not None else 0), int(spec.max if spec.max is not None else 10**9))
+                w.setSingleStep(int(spec.step or 1)); w.setValue(spec.default); w.setFixedWidth(84)
+            else:
+                w = QLineEdit(str(spec.default)); w.setFixedWidth(110)
+            w.setToolTip(spec.help)
+            label = QLabel(key.replace("_", " ").capitalize()); label.setObjectName("muted")
+            label.setToolTip(spec.help)
+            at = max(0, self.param_box.count() - 1)
+            self.param_box.insertWidget(at, label); self.param_box.insertWidget(at + 1, w)
+            self.widgets[key] = w
+
+    def _params(self) -> list:
+        out = []
+        for key, w in self.widgets.items():
+            v = w.text() if isinstance(w, QLineEdit) else w.value()
+            out += ["--param", f"{key}={v}"]
+        return out
+
+    # ---- data ----
+    @property
+    def busy(self) -> bool:
+        return bool(self.proc and self.proc.state() != QProcess.ProcessState.NotRunning)
+
+    def reload(self):
+        self.loaded = True
+        rows = dedup_store.read_report()
+        self.groups = {}
+        for r in rows:
+            self.groups.setdefault(int(r["group_id"]), []).append(r)
+        cur = self.glist.currentItem().data(Qt.ItemDataRole.UserRole) if self.glist.currentItem() else None
+        self.glist.blockSignals(True); self.glist.clear()
+        n_pend = n_moved = 0
+        for gid in sorted(self.groups):
+            rs = self.groups[gid]
+            states = {r["status"] for r in rs}
+            state = "pending" if "pending" in states else ("moved" if "moved" in states else "done")
+            n_pend += sum(r["keeper"] == "0" and r["status"] == "pending" for r in rs)
+            n_moved += sum(r["status"] == "moved" for r in rs)
+            it = QListWidgetItem(f"#{gid}   {len(rs)} images   sim {float(rs[0]['score']):.3f}   {state}")
+            it.setData(Qt.ItemDataRole.UserRole, gid)
+            if state != "pending":
+                it.setForeground(QColor("#888"))
+            self.glist.addItem(it)
+        self.glist.blockSignals(False)
+        self.pending_remove, self.n_moved = n_pend, n_moved
+        self.summary.setText(f"{len(self.groups):,} groups  ·  {n_pend:,} duplicate images waiting to be moved  ·  "
+                             f"{n_moved:,} already moved  ·  one image per group is kept")
+        self.apply_btn.setText(f"Move {n_pend:,} duplicates to discarded" if n_pend else "Move duplicates to discarded")
+        row = 0
+        for i in range(self.glist.count()):
+            if self.glist.item(i).data(Qt.ItemDataRole.UserRole) == cur:
+                row = i
+        if self.glist.count():
+            self.glist.setCurrentRow(row)
+        self._show_group()
+
+    def _thumb_ready(self, rel, size, img):
+        it = self._titems.get(rel)
+        if it is None or size != THUMB + 30 or img.isNull():
+            return
+        try:
+            it.setIcon(QIcon(QPixmap.fromImage(img)))
+        except RuntimeError:
+            pass
+
+    def _show_group(self):
+        if self._tbatch:
+            self._tbatch.cancel()
+        self._tbatch, self._titems = Batch(), {}
+        self.thumbs.clear()
+        it = self.glist.currentItem()
+        if it:
+            for r in self.groups.get(it.data(Qt.ItemDataRole.UserRole), []):
+                keep = r["keeper"] == "1"
+                moved = r["status"] == "moved"
+                head = "✔ KEEP" if keep else ("✕ moved" if moved else "✕ remove")
+                size = f"{r['width']}×{r['height']} · {int(r['bytes']) // 1024:,} KB"
+                t = QListWidgetItem(placeholder(THUMB + 30), f"{head}\n{size}\n{r['image'].split('/', 1)[1]}")
+                rel = r["moved_to"] if moved else r["image"]
+                self._titems[rel] = t
+                thumbs().request(rel, THUMB + 30, self._tbatch)
+                t.setData(Qt.ItemDataRole.UserRole, r)
+                t.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+                if keep:
+                    t.setBackground(QColor("#e3f1fb"))
+                self.thumbs.addItem(t)
+        self._update_buttons()
+
+    def _update_buttons(self):
+        free = not self.busy and not (self.win.proc and self.win.proc.state() != QProcess.ProcessState.NotRunning)
+        sel = self.thumbs.selectedItems()
+        can_keep = bool(sel) and sel[0].data(Qt.ItemDataRole.UserRole)["status"] == "pending" \
+            and sel[0].data(Qt.ItemDataRole.UserRole)["keeper"] == "0"
+        self.keep_btn.setEnabled(free and can_keep)
+        self.apply_btn.setEnabled(free and self.pending_remove > 0)
+        self.restore_btn.setEnabled(free and getattr(self, "n_moved", 0) > 0)
+        self.find_btn.setEnabled(free); self.stop_btn.setEnabled(self.busy)
+
+    def make_keeper(self):
+        sel = self.thumbs.selectedItems()
+        if not sel or not self.keep_btn.isEnabled():
+            return
+        r = sel[0].data(Qt.ItemDataRole.UserRole)
+        dedup_store.set_keeper(DATA, r["group_id"], r["image"])
+        self.win.log(f"group {r['group_id']}: keeper set to {r['image']}")
+        self.reload()
+
+    # ---- actions run through the command-line tool, so the GUI never freezes ----
+    def find(self):
+        if self.limit.value() == 0 and self.pending_remove:
+            if QMessageBox.question(self, "Replace results?", f"{self.pending_remove:,} pending duplicates from the "
+                    "previous search will be replaced by the new search. Continue?") != QMessageBox.StandardButton.Yes:
+                return
+        args = ["find", "--finder", self.finder.currentData(), "--limit", str(self.limit.value())] + self._params()
+        self._run(args, "Searching for duplicates")
+
+    def apply(self):
+        if QMessageBox.question(self, "Move duplicates", f"Keep one image per group and move the other "
+                f"{self.pending_remove:,} image(s) to data/discarded/?\n\nYou can bring them back with "
+                "'Restore moved duplicates'.") == QMessageBox.StandardButton.Yes:
+            self._run(["apply"], "Moving duplicates")
+
+    def restore(self):
+        if QMessageBox.question(self, "Restore", f"Move {self.n_moved:,} duplicate image(s) back to data/raw/?") \
+                == QMessageBox.StandardButton.Yes:
+            self._run(["restore"], "Restoring duplicates")
+
+    def _run(self, args, label):
+        if self.busy or (self.win.proc and self.win.proc.state() != QProcess.ProcessState.NotRunning):
+            QMessageBox.information(self, "Busy", "Another job is running. Wait for it or press Stop.")
+            return
+        self.proc = QProcess(self)
+        self.proc.setWorkingDirectory(str(REPO))
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._output)
+        self.proc.finished.connect(lambda code, _s: self._finished(code, label))
+        self.progress.setRange(0, 0); self.status.setText(label + "…")
+        self.win.log(f"{label}: python tools/dedup_cli.py " + " ".join(args))
+        self.proc.start(sys.executable, ["-u", "tools/dedup_cli.py"] + args)
+        self._update_buttons()
+
+    def _output(self):
+        for line in bytes(self.proc.readAllStandardOutput()).decode(errors="replace").splitlines():
+            if line.startswith("PROGRESS "):
+                _, phase, done, total = line.split()
+                self.progress.setRange(0, int(total)); self.progress.setValue(int(done))
+                self.status.setText(f"{phase}  {int(done):,} / {int(total):,}")
+            elif line.strip():
+                bad = "Traceback" in line or "Error" in line
+                self.win.log("[dedup] " + line, "ERROR" if bad else ("WARN" if line.startswith("WARN") else "PROC"))
+
+    def _finished(self, code, label):
+        self.progress.setRange(0, 1); self.progress.setValue(1 if code == 0 else 0)
+        self.status.setText("Done" if code == 0 else "Stopped / failed")
+        self.win.log(f"{label} finished (exit code {code})", "OK" if code == 0 else "WARN")
+        self.win.refresh(force=True)    # image paths in the database may have changed
+        self._update_buttons()
 
 
 class MainWindow(QMainWindow):
-    NAV = ["✔   Verified", "✕   Discarded", "▥   Statistics"]
-    TITLES = ["Verified images", "Discarded images", "Statistics"]
+    NAV = ["✔   Verified", "✕   Discarded", "▥   Statistics", "▣   Duplicates"]
+    TITLES = ["Verified images", "Discarded images", "Statistics", "Duplicate images"]
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Face attribute labeling")
         self.resize(1400, 860)
+        self.setMinimumSize(1180, 680)
         self.proc = None
         self.target_n = 0
-        self.rows = []
+        self.db = LabelDB()
+        self._rev, self._last_refresh, self._shown = -1, 0.0, None
 
         # ---- labeling controls ----
         self.n = QSpinBox(); self.n.setRange(1, 200000); self.n.setValue(100)
@@ -404,7 +775,7 @@ class MainWindow(QMainWindow):
         self.workers.setToolTip("Parallel requests to the VLM server.")
         for sp in (self.n, self.seed, self.workers):
             sp.setFixedWidth(92)
-        self.move_chk = QCheckBox("Move overlay images to discarded/"); self.move_chk.setChecked(True)
+        self.move_chk = QCheckBox("Discard overlay images"); self.move_chk.setChecked(True)
         self.start = QPushButton("Start labeling"); self.start.setObjectName("start")
         self.stop = QPushButton("Stop"); self.stop.setObjectName("stop"); self.stop.setEnabled(False)
         self.start.clicked.connect(self.start_run)
@@ -418,22 +789,25 @@ class MainWindow(QMainWindow):
         self.refresh_btn = QPushButton("⟳  Refresh")
         self.refresh_btn.setShortcut("F5")
         self.refresh_btn.setToolTip("Reload labels from disk (F5)")
-        self.refresh_btn.clicked.connect(lambda: (self.log("manual refresh"), self.refresh()))
+        self.refresh_btn.clicked.connect(lambda: self.refresh(force=True))
         self.auto_chk = QCheckBox("Auto refresh")
         self.auto_chk.setChecked(True)
-        self.auto_chk.setToolTip("Reload automatically when vlm_labels.csv changes (e.g. a command-line run).")
-        self._sig = self._csv_sig()
-        self.poll = QTimer(self); self.poll.timeout.connect(self._poll); self.poll.start(2000)
+        self.auto_chk.setToolTip("Update automatically when the label database changes (e.g. a labeling run).")
+        self.poll = QTimer(self); self.poll.timeout.connect(self._poll); self.poll.start(1000)
 
         # ---- pages (tab bar hidden; the sidebar is the navigation) ----
-        self.kept = Gallery("raw", self.show_detail)
-        self.disc = Gallery("discarded", self.show_detail)
+        self.kept = Gallery("raw", self)
+        self.disc = Gallery("discarded", self)
         self.stats = StatsTab()
         self.tabs = QTabWidget()
         self.tabs.addTab(self.kept, "Verified (kept)")
         self.tabs.addTab(self.disc, "Discarded")
         self.tabs.addTab(self.stats, "Statistics")
+        self.dups = DupTab(self)
+        self.tabs.addTab(self.dups, "Duplicates")
         self.tabs.tabBar().hide()
+        for page in (self.kept, self.disc, self.stats, self.dups):
+            page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.tabs.currentChanged.connect(self._on_tab)
 
         # ---- sidebar ----
@@ -458,20 +832,18 @@ class MainWindow(QMainWindow):
         self.title = QLabel(self.TITLES[0]); self.title.setObjectName("pageTitle")
         head = QHBoxLayout(); head.setSpacing(8)
         head.addWidget(self.title); head.addStretch(); head.addWidget(self.start); head.addWidget(self.stop)
-        opts = QHBoxLayout(); opts.setSpacing(8)
+        opts = self.opts = QHBoxLayout(); opts.setSpacing(8)
         for label, w in (("Images", self.n), ("Seed", self.seed), ("Workers", self.workers)):
             lab = QLabel(label); lab.setObjectName("muted"); opts.addWidget(lab); opts.addWidget(w); opts.addSpacing(8)
         opts.addWidget(self.move_chk); opts.addStretch(); opts.addWidget(self.auto_chk); opts.addWidget(self.refresh_btn)
-        prow = QHBoxLayout(); prow.addWidget(self.progress, 1); prow.addWidget(self.status)
+        prow = self.prow = QHBoxLayout(); prow.addWidget(self.progress, 1); prow.addWidget(self.status)
 
         # ---- detail panel ----
-        self.preview = QLabel("Select an image"); self.preview.setObjectName("preview")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(340, 340)
+        self.preview = PreviewLabel("Select an image"); self.preview.setObjectName("preview")
         self.d = {k: QLabel("-") for k in ("Age", "Emotion", "Gender", "Overlay", "Source", "File")}
         for v in self.d.values():
             v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); v.setWordWrap(True)
-        dform = QFormLayout(); dform.setVerticalSpacing(6)
+        dform = QFormLayout(); dform.setVerticalSpacing(6); dform.setContentsMargins(0, 8, 0, 0)
         for k, v in self.d.items():
             lab = QLabel(k); lab.setObjectName("muted"); dform.addRow(lab, v)
         self.act = QPushButton(); self.act.clicked.connect(self.move_selected)
@@ -479,8 +851,8 @@ class MainWindow(QMainWindow):
         self.hint = QLabel("Tip: Ctrl/Shift-click to select several images.")
         self.hint.setObjectName("muted"); self.hint.setWordWrap(True)
         dl = QVBoxLayout(); dl.setContentsMargins(16, 0, 0, 0); dl.setSpacing(10)
-        dl.addWidget(self.preview); dl.addLayout(dform); dl.addWidget(self.act)
-        dl.addWidget(self.open_btn); dl.addWidget(self.hint); dl.addStretch()
+        dl.addWidget(self.preview, 1); dl.addLayout(dform); dl.addWidget(self.act)
+        dl.addWidget(self.open_btn); dl.addWidget(self.hint)
         detail = self.detail = QWidget(); detail.setLayout(dl); detail.setMinimumWidth(386); detail.setMaximumWidth(436)
 
         split = QSplitter(); split.addWidget(self.tabs); split.addWidget(detail)
@@ -507,12 +879,25 @@ class MainWindow(QMainWindow):
 
         sys.excepthook = self._on_exception
         self.log(f"GUI started. data dir: {DATA}")
-        self.reload()
-        self.show_detail(self.kept)
+        self.refresh(force=True)
 
     def _on_tab(self, i: int):
         self.nav.blockSignals(True); self.nav.setCurrentRow(i); self.nav.blockSignals(False)
         self.title.setText(self.TITLES[i])
+        on_dups = i == 3                      # labeling controls are irrelevant there
+        if on_dups and not self.dups.loaded:
+            self.dups.reload()
+        keep = (self.auto_chk, self.refresh_btn)
+        for k in range(self.opts.count()):
+            w = self.opts.itemAt(k).widget()
+            if w is not None and w not in keep:
+                w.setVisible(not on_dups)
+        for w in (self.start, self.stop):
+            w.setVisible(not on_dups)
+        for k in range(self.prow.count()):
+            w = self.prow.itemAt(k).widget()
+            if w is not None:
+                w.setVisible(not on_dups)
         self.show_detail(self.tabs.currentWidget())
 
     # ---- logging ----
@@ -533,49 +918,42 @@ class MainWindow(QMainWindow):
         self.log("Unhandled exception:\n" + "".join(traceback.format_exception(etype, value, tb)).rstrip(), "ERROR")
 
     # ---- data ----
-    def reload(self):
-        self._sig = self._csv_sig()
-        self.rows = read_rows(VLM_CSV)
-        self.kept.set_rows(self.rows); self.disc.set_rows(self.rows)
-        total = max(0, sum(1 for _ in MASTER_CSV.open()) - 1) if MASTER_CSV.exists() else 0
-        self.stats.update_data(self.rows, total)
-        ok = [r for r in self.rows if r["valid"] == "1"]
-        n_disc = sum(r["image"].startswith("discarded/") for r in ok)
-        self.nav.item(0).setText(f"{self.NAV[0]}   ({len(ok) - n_disc:,})")
-        self.nav.item(1).setText(f"{self.NAV[1]}   ({n_disc:,})")
-        self.side_bar.setRange(0, max(total, 1)); self.side_bar.setValue(len(ok))
-        self.side_count.setText(f"{len(ok):,} / {total:,}")
-        self.statusBar().showMessage(f"{len(ok):,} labeled of {total:,} images  ·  {total - len(ok):,} remaining")
-        self.log(f"Loaded labels: {len(ok):,} valid ({len(ok) - n_disc:,} kept, {n_disc:,} discarded), "
-                 f"{len(self.rows) - len(ok):,} invalid, {total - len(ok):,} of {total:,} images unlabeled")
-
-    def _csv_sig(self):
-        try:
-            st = VLM_CSV.stat()
-            return (st.st_mtime_ns, st.st_size)
-        except FileNotFoundError:
-            return None
-
     def _poll(self):
-        if self.auto_chk.isChecked() and self._csv_sig() != self._sig:
-            self.log("labels file changed -> auto refresh")
+        """Cheap check (one tiny SQL query); only refreshes when a writer committed something new."""
+        if not self.auto_chk.isChecked() or time.monotonic() - self._last_refresh < 1.0:
+            return
+        if self.db.rev() != self._rev:
             self.refresh()
 
     def _gallery(self):
         w = self.tabs.currentWidget()
         return w if isinstance(w, Gallery) else self.kept
 
-    def refresh(self):
-        """Reload from disk, keeping the current page and selection."""
-        gallery = self._gallery()
-        keep = {r["image"] for r in gallery.selected()}
-        self._sig = self._csv_sig()
-        self.reload()
-        gallery.select_paths(keep)
-        self.show_detail(gallery)
+    def refresh(self, force: bool = False):
+        """Update everything from the database. Galleries update in place (selection/scroll survive)."""
+        self._rev = self.db.rev()
+        self._last_refresh = time.monotonic()
+        self.kept.refresh(force=force); self.disc.refresh(force=force)
+        self.stats.update_data(self.db)
+        if isinstance(self.tabs.currentWidget(), DupTab) or (force and self.dups.loaded):
+            self.dups.reload()
+        t = self.db.totals()
+        n_dup = self.db.dups_pending_count()
+        self.nav.item(0).setText(f"{self.NAV[0]}   ({t['kept']:,})")
+        self.nav.item(1).setText(f"{self.NAV[1]}   ({t['discarded']:,})")
+        self.nav.item(3).setText(self.NAV[3] + (f"   ({n_dup:,})" if n_dup else ""))
+        self.side_bar.setRange(0, max(t["total"], 1)); self.side_bar.setValue(t["labeled"])
+        self.side_count.setText(f"{t['labeled']:,} / {t['total']:,}")
+        self.statusBar().showMessage(f"{t['labeled']:,} labeled of {t['total']:,} images  ·  {t['unlabeled']:,} remaining")
+        if force:
+            self.log(f"Refreshed: {t['labeled']:,} labeled ({t['kept']:,} kept, {t['discarded']:,} discarded), "
+                     f"{t['failed']:,} failed, {t['unlabeled']:,} unlabeled")
 
     # ---- labeling process ----
     def start_run(self):
+        if self.dups.busy:
+            QMessageBox.information(self, "Busy", "A duplicate job is running. Wait for it or press Stop.")
+            return
         env = load_env()
         if "UNSLOTH_API_KEY" not in env or "UNSLOTH_BASE_URL" not in env:
             self.log("UNSLOTH_API_KEY / UNSLOTH_BASE_URL not found in .env", "ERROR")
@@ -604,6 +982,7 @@ class MainWindow(QMainWindow):
         self.start.setEnabled(not running); self.stop.setEnabled(running)
         for w in (self.n, self.seed, self.workers, self.move_chk, self.act):
             w.setEnabled(not running)
+        self.dups._update_buttons()
 
     def on_output(self):
         text = bytes(self.proc.readAllStandardOutput()).decode(errors="replace")
@@ -626,8 +1005,7 @@ class MainWindow(QMainWindow):
         self.log(f"Labeling process finished (exit code {code})", "OK" if code == 0 else "WARN")
         if code == 0:
             self.progress.setValue(self.target_n)
-        self.reload()
-        self.show_detail(self.tabs.currentWidget())
+        self.refresh(force=True)
 
     # ---- detail / actions ----
     def show_detail(self, gallery):
@@ -637,6 +1015,7 @@ class MainWindow(QMainWindow):
         if not isinstance(gallery, Gallery):
             return
         sel = gallery.selected()
+        sig = (sel[0]["path"], len(sel)) if sel else None
         in_disc = gallery is self.disc
         self.act.setObjectName("safe" if in_disc else "danger")
         self.act.setStyle(self.act.style())
@@ -644,29 +1023,31 @@ class MainWindow(QMainWindow):
         self.act.setText(("↩  Restore to kept" if in_disc else "✕  Move to discarded") + (f" ({n})" if n else ""))
         self.act.setEnabled(n > 0 and not (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning))
         self.open_btn.setEnabled(n > 0)
+        if sig == self._shown:
+            return                                              # same selection as before: nothing to reload
+        self._shown = sig
         if not sel:
-            self.preview.setPixmap(QPixmap()); self.preview.setText("Select an image")
+            self.preview.clear_image("Select an image")
             for v in self.d.values():
                 v.setText("-")
             return
         r = sel[0]
-        pm = load_pixmap(DATA / r["image"], 520)
+        pm = load_pixmap(DATA / r["path"], 520)
         if pm.isNull():
-            self.preview.setText("(cannot load image)")
-            self.log(f"cannot load image {r['image']}", "WARN")
+            self.preview.clear_image("(cannot load image)")
+            self.log(f"cannot load image {r['path']}", "WARN")
         else:
-            self.preview.setPixmap(pm.scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                                             Qt.TransformationMode.SmoothTransformation))
-        self.d["Age"].setText(r["vlm_age"]); self.d["Emotion"].setText(r["vlm_emotion"])
-        self.d["Gender"].setText(r["vlm_gender"]); self.d["Overlay"].setText(r["vlm_overlay"])
-        self.d["Source"].setText(r["image"].split("/")[1]); self.d["File"].setText(r["image"])
+            self.preview.set_image(pm)
+        self.d["Age"].setText(r["age"]); self.d["Emotion"].setText(r["emotion"])
+        self.d["Gender"].setText(r["gender"]); self.d["Overlay"].setText(r["overlay"] or "-")
+        self.d["Source"].setText(r["source"]); self.d["File"].setText(r["path"])
         if n > 1:
-            self.d["File"].setText(f"{r['image']}  (+{n - 1} more selected)")
+            self.d["File"].setText(f"{r['path']}  (+{n - 1} more selected)")
 
     def open_folder(self):
         sel = self._gallery().selected()
         if sel:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str((DATA / sel[0]["image"]).parent)))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str((DATA / sel[0]["path"]).parent)))
 
     def move_selected(self):
         gallery = self._gallery()
@@ -675,10 +1056,11 @@ class MainWindow(QMainWindow):
             return
         to_disc = gallery is self.kept
         mapping = {}
-        missing = [r["image"] for r in sel if not (DATA / r["image"]).exists()]
-        sel = [r for r in sel if r["image"] not in missing]
+        missing = [r["path"] for r in sel if not (DATA / r["path"]).exists()]
         for r in sel:
-            old = r["image"]
+            old = r["path"]
+            if old in missing:
+                continue
             new = ("discarded/" if to_disc else "raw/") + old.split("/", 1)[1]
             try:
                 (DATA / new).parent.mkdir(parents=True, exist_ok=True)
@@ -690,18 +1072,23 @@ class MainWindow(QMainWindow):
         for m in missing:
             self.log(f"skipped {m}: file no longer exists", "WARN")
         if mapping:
-            rewrite_paths(VLM_CSV, mapping); rewrite_paths(MASTER_CSV, mapping)
-            self.log(f"updated vlm_labels.csv and master.csv ({len(mapping)} paths)", "OK")
-        self.reload()
-        self.show_detail(gallery)
+            self.db.move_paths(mapping)
+            self.log(f"database updated ({len(mapping)} paths)", "OK")
+        self.refresh()
         msg = f"Moved {len(mapping)} image(s) to {'discarded' if to_disc else 'kept'}"
         if missing:
             msg += f"  ·  {len(missing)} skipped (file was already moved; list refreshed)"
         self.statusBar().showMessage(msg, 6000)
 
     def closeEvent(self, e):
-        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
-            self.proc.kill(); self.proc.waitForFinished(2000)
+        for pr in (self.proc, self.dups.proc):
+            if pr and pr.state() != QProcess.ProcessState.NotRunning:
+                pr.kill(); pr.waitForFinished(2000)
+        for g in (self.kept, self.disc):
+            g.shutdown()
+        if self.dups._tbatch:
+            self.dups._tbatch.cancel()
+        thumbs().pool.waitForDone(1500)
         super().closeEvent(e)
 
 
