@@ -753,7 +753,7 @@ class DupTab(QWidget):
         self.glist.blockSignals(False)
         self.pending_remove, self.n_moved = n_pend, n_moved
         self.summary.setText(f"{len(self.groups):,} groups  ·  {n_pend:,} duplicate images waiting to be moved  ·  "
-                             f"{n_moved:,} already moved  ·  one image per group is kept")
+                             f"{n_moved:,} already moved  ·  one image per group is kept  ·  {self._person_text()}")
         self.apply_btn.setText(f"Move {n_pend:,} duplicates to discarded" if n_pend else "Move duplicates to discarded")
         row = 0
         for i in range(self.glist.count()):
@@ -762,6 +762,10 @@ class DupTab(QWidget):
         if self.glist.count():
             self.glist.setCurrentRow(row)
         self._show_group()
+
+    def _person_text(self) -> str:
+        linked, persons = self.win.db.c.execute("SELECT COUNT(person_id), COUNT(DISTINCT person_id) FROM images").fetchone()
+        return f"{linked:,} images linked to {persons:,} persons"
 
     def _thumb_ready(self, rel, size, img):
         it = self._titems.get(rel)
@@ -885,6 +889,7 @@ class DupTab(QWidget):
         self.status.setText(f"Done in {took}" if code == 0 else f"Stopped / failed after {took}")
         self.win.log(f"{label} finished after {took} (exit code {code})", "OK" if code == 0 else "WARN")
         self.win.refresh(force=True)    # image paths in the database may have changed
+        self.summary.setText(self.summary.text().rsplit("  ·  ", 1)[0] + "  ·  " + self._person_text())
         self._update_buttons()
 
 

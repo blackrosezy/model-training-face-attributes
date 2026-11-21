@@ -13,7 +13,7 @@ START_TIME = time.perf_counter()
 
 # Class names based on the provided folder structure; adjust if yours differ.
 CLASS_NAMES: Dict[str, List[str]] = {
-    "age": ["01-10", "11-20", "21-30", "31-40", "41-55", "56-65", "66-80", "80plus"],
+    "age": ["0-3", "4-7", "8-11", "12-15", "16-19", "20-23", "24-27", "28-31", "32-35", "36-39", "40-43", "44-47", "48-51", "52-55", "56-59", "60-63", "64-67", "68-71", "72-75", "76-79", "80+"],
     "emotion": ["angry", "fear", "happy", "neutral", "sad", "surprise"],
     "gender": ["female", "male"],
 }

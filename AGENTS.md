@@ -25,9 +25,11 @@ Load env first: `set -a; source .env; set +a`.
 
 ## Labels, GUI and dedup (tools/)
 - **Label store is SQLite**, not CSV: `~/.local/share/face-labeling/labels.db` (override: env `FACE_LABELS_DB`). It must stay on the
-  WSL ext4 disk - SQLite on `/mnt/d` is ~200x slower. Images stay in `data/raw/` and `data/discarded/` (on `/mnt/d`).
+  WSL ext4 disk - SQLite on `/mnt/d` is ~200x slower. Images are in `data/raw/` and `data/discarded/`; `data` is a symlink to `/home/cribpc/face-data` (WSL ext4, moved off `/mnt/d` on 2026-11-21 via `tools/move_data_to_wsl.sh`; the old copy is `data.d_backup/`).
   Old CSVs are in `data/labels/csv_backup/`. `python tools/labeldb.py stats|export|migrate`.
+- **Same-person links**: `images.person_id` (NULL = not clustered, treat as its own person) + table `persons`. Filled **automatically, as soon as `dedup_cli.py find` has found its groups** (torch_gpu and face_id groups only, DB only); manual: `python tools/persons.py from-dups [--apply]` (dry run by default), `stats`, `set` for manual fixes. Use it to split train/val/test by person.
 - GUI thumbnail cache: `~/.cache/face-labeling/thumbs/` (safe to delete). Run the GUI with `./run_gui.sh`.
-- Duplicate detection: `tools/dedup/` (pluggable finders, see its README). GUI offers `torch_gpu` only; `faiss_embed` is hidden but kept.
+- Duplicate detection: `tools/dedup/` (pluggable finders, see its README). GUI offers `torch_gpu` (default, exact duplicates) and `face_id`; `faiss_embed` is hidden but kept.
+  `face_id` = same person at any angle: InsightFace `buffalo_l` ArcFace embeddings on GPU (onnxruntime-gpu; `import torch` first so CUDA libs load), threshold 0.5, cached in `data/cache/face_id_buffalo_l.npz`. Marked `slow`: ~35 img/s, so never run it on the whole dataset (~268k images, hours) without the user asking; use `--limit`.
   `python tools/dedup_cli.py find|apply|restore|list`.
-- Bulk file moves on `/mnt/d` from WSL are slow (~4k files/min); native Windows `powershell.exe` renames are ~1k files/s.
+- Bulk file moves on `/mnt/d` (anything still there) from WSL are slow (~4k files/min); native Windows `powershell.exe` renames are ~1k files/s.

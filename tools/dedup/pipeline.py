@@ -23,6 +23,14 @@ def find(data_dir: Path, finder: str, params: Dict, limit: int, progress: Callab
     print(f"finder={finder} params={json.dumps(params)} images={len(images):,}", flush=True)
     groups = registry.create(finder, **params).find(data_dir, images, progress)
 
+    # Same face found -> record it NOW (images.person_id), before the slow keeper selection / report writing.
+    try:
+        import persons
+        from labeldb import LabelDB
+        persons.link_groups(LabelDB(), [g.members for g in groups], finder)
+    except Exception as e:                                    # never let this break the search result
+        print(f"WARN linking same-person images failed: {e}", flush=True)
+
     # Keep the history of duplicates that were already moved, so "restore" keeps working after a new search.
     old_rows = store.read_report()
     moved_groups = {r["group_id"] for r in old_rows if r["status"] == "moved"}

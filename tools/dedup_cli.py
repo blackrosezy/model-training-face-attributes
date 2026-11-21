@@ -2,6 +2,7 @@
 
   python tools/dedup_cli.py list
   python tools/dedup_cli.py find --finder torch_gpu --param threshold=0.95 [--limit 5000]
+                                     (links same-person images into images.person_id as soon as groups are found, see persons.py)
   python tools/dedup_cli.py apply      # keep 1 per group, move the rest to data/discarded/
   python tools/dedup_cli.py restore    # undo apply
 """

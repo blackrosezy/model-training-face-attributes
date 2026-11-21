@@ -211,3 +211,4 @@ __marimo__/
 /data
 /wandb
 /*.onnx
+/data.d_backup

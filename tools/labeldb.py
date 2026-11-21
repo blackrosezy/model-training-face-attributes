@@ -56,6 +56,16 @@ class LabelDB:
         self.c.execute("PRAGMA journal_mode=WAL")
         self.c.execute("PRAGMA synchronous=NORMAL")
         self.c.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add person_id to databases created before it existed (idempotent, safe while other processes run)."""
+        cols = {r[1] for r in self.c.execute("PRAGMA table_info(images)")}
+        if "person_id" not in cols:
+            self.c.execute("ALTER TABLE images ADD COLUMN person_id INTEGER")   # NULL = not clustered yet
+        self.c.execute("CREATE INDEX IF NOT EXISTS idx_images_person ON images(person_id)")
+        self.c.execute("CREATE TABLE IF NOT EXISTS persons("
+                       "person_id INTEGER PRIMARY KEY, source TEXT, n_images INTEGER, note TEXT)")
 
     # ---- plumbing ----
     @contextmanager
