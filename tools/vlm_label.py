@@ -5,7 +5,7 @@ Legacy folder labels are never used. Resumable; results go to the label database
 Images flagged (overlay, more than one face, or not a real photo: stored in the same `overlay` field) are moved from data/raw/<src>/ to data/discarded/<src>/
 and the database is updated to the new path.
 
-Usage: python tools/vlm_label.py --n 100 [--seed 0] [--workers 4] [--no-move]
+Usage: python tools/vlm_label.py --n 100 [--seed 0] [--workers 4] [--no-move] [--paths raw/a/1.jpg ...]
 Env: UNSLOTH_BASE_URL, UNSLOTH_API_KEY (from .env)
 """
 import argparse, base64, json, os, random, re, shutil, sys
@@ -37,6 +37,9 @@ PROMPT = (
     "THEN count the distinct human faces visible in the image (face_count). Count every face, including small, partial, "
     "background, reflected or printed faces (e.g. on a poster or photo), not just the main subject.\n"
     "Then classify age, emotion, gender (for the main/largest face).\n"
+    "For age, the options are narrow 4-year groups. Pick EXACTLY ONE option, copied character-for-character from the list. "
+    "NEVER write a range of your own, NEVER merge or span several groups (e.g. '64-75' is WRONG), and never write a single "
+    "number. If you are unsure between two neighbouring groups, pick the single closest one.\n"
     "Reply with ONLY a JSON object, keys in this order:\n"
     + json.dumps({"overlay_evidence": "short description of any added watermark/logo/text and where, or 'nothing'",
                   "style_evidence": "one short phrase on why this is or is not a real photograph",
@@ -83,12 +86,16 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--no-move", action="store_true")
+    ap.add_argument("--paths", nargs="+", help="label exactly these images (e.g. retry failed ones) instead of picking --n new ones")
     a = ap.parse_args()
 
     db = LabelDB()
-    todo = db.candidates("raw", only_unlabeled=True)          # raw/ images that are not labeled yet
-    random.Random(a.seed).shuffle(todo)
-    todo = todo[: a.n]
+    if a.paths:
+        todo = [p for p in a.paths if p.startswith("raw/")]    # explicit retry list
+    else:
+        todo = db.candidates("raw", only_unlabeled=True)      # raw/ images that are not labeled yet
+        random.Random(a.seed).shuffle(todo)
+        todo = todo[: a.n]
 
     results, batch = [], []
     with ThreadPoolExecutor(a.workers) as ex:

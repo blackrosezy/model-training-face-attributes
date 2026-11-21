@@ -129,7 +129,11 @@ class LabelDB:
     # ---- queries used by the GUI ----
     @staticmethod
     def _where(loc: str, f: Dict[str, str]):
-        sql, args = "loc=? AND valid=1", [loc]
+        # kept: labeled images only. discarded: EVERYTHING in the discarded/ folder (labeled or not, dedup-moved too).
+        if loc == "failed":                           # kept images the VLM could not label (valid=0), to review later
+            sql, args = "loc='raw' AND valid=0", []
+        else:
+            sql, args = ("loc=? AND valid=1", [loc]) if loc != "discarded" else ("loc=?", [loc])
         for key in ("age", "emotion", "gender", "source", "overlay"):
             if f.get(key) and f[key] != "All":
                 sql += f" AND {key}=?"; args.append(f[key])
@@ -145,17 +149,23 @@ class LabelDB:
         return [dict(r) for r in self.c.execute(q, args + [limit, offset])]
 
     def sources(self, loc: str) -> List[str]:
-        return [r[0] for r in self.c.execute("SELECT DISTINCT source FROM images WHERE loc=? AND valid=1 ORDER BY 1", (loc,))]
+        if loc == "failed":
+            where, args = "loc='raw' AND valid=0", ()
+        else:
+            where, args = "loc=?" + (" AND valid=1" if loc != "discarded" else ""), (loc,)
+        return [r[0] for r in self.c.execute(f"SELECT DISTINCT source FROM images WHERE {where} ORDER BY 1", args)]
 
     def distribution(self, field: str, kept_only: bool) -> Counter:
         where = "valid=1" + (" AND loc='raw'" if kept_only else "")
         return Counter({r[0]: r[1] for r in self.c.execute(f"SELECT {field}, COUNT(*) FROM images WHERE {where} GROUP BY 1")})
 
     def totals(self) -> Dict[str, int]:
-        r = self.c.execute("""SELECT COUNT(*), COALESCE(SUM(valid=1),0), COALESCE(SUM(valid=1 AND loc='raw'),0),
-               COALESCE(SUM(valid=1 AND loc='discarded'),0), COALESCE(SUM(valid=0),0) FROM images""").fetchone()
-        total, labeled, kept, disc, failed = r
-        return {"total": total, "labeled": labeled, "kept": kept, "discarded": disc, "failed": failed,
+        """Discarded images are forgotten: `total`, `labeled` and `unlabeled` only look at kept (raw/) images,
+        so total = labeled + unlabeled. `discarded` is just the size of the discarded/ folder."""
+        total, labeled, failed, disc = self.c.execute(
+            """SELECT COALESCE(SUM(loc='raw'),0), COALESCE(SUM(loc='raw' AND valid=1),0),
+                      COALESCE(SUM(loc='raw' AND valid=0),0), COALESCE(SUM(loc='discarded'),0) FROM images""").fetchone()
+        return {"total": total, "labeled": labeled, "kept": labeled, "discarded": disc, "failed": failed,
                 "unlabeled": total - labeled}
 
     def get(self, path: str) -> Optional[Dict]:

@@ -167,6 +167,8 @@ def progress_text(done: int, total: int, started: float, unit: str = "", job_sta
 
 
 def short_label(r: dict) -> str:
+    if r["valid"] != 1:
+        return "failed" if r["valid"] == 0 else "not labeled"
     g = {"female": "F", "male": "M"}.get(r["gender"], "?")
     return f"{r['age']} · {r['emotion']} · {g}"
 
@@ -409,6 +411,8 @@ class Gallery(QWidget):
 
         top = QHBoxLayout()
         pairs = [("Age", self.f_age), ("Emotion", self.f_emo), ("Gender", self.f_gen), ("Source", self.f_src)]
+        if loc == "failed":
+            pairs = [("Source", self.f_src)]               # these images have no labels to filter on
         if loc == "discarded":
             pairs.append(("Overlay", self.f_ovl))
         for text, box in pairs:
@@ -602,9 +606,12 @@ class StatsTab(QWidget):
                          ("Unlabeled", t["unlabeled"])):
             self.cards[key].setText(f"{val:,}")
         kept_only = self.scope.currentIndex() == 0
+        counted = 0
         for key, chart in self.charts.items():
-            chart.set_counts(db.distribution(key, kept_only and key != "overlay"))   # overlay images are never "kept"
-        counted = t["kept"] if kept_only else t["labeled"]
+            dist = db.distribution(key, kept_only and key != "overlay")   # overlay images are never "kept"
+            chart.set_counts(dist)
+            if key == "age":
+                counted = sum(dist.values())
         self.updated.setText(f"updated {datetime.now().strftime('%H:%M:%S')}  ·  {counted:,} images counted")
 
 
@@ -900,8 +907,8 @@ class SettingsTab(QWidget):
 
 
 class MainWindow(QMainWindow):
-    NAV = ["✔   Verified", "✕   Discarded", "▥   Statistics", "▣   Duplicates", "⚙   Settings"]
-    TITLES = ["Verified images", "Discarded images", "Statistics", "Duplicate images", "Settings"]
+    NAV = ["✔   Verified", "✕   Discarded", "⚠   Failed", "▥   Statistics", "▣   Duplicates", "⚙   Settings"]
+    TITLES = ["Verified images", "Discarded images", "Failed / invalid images", "Statistics", "Duplicate images", "Settings"]
 
     def __init__(self):
         super().__init__()
@@ -955,17 +962,19 @@ class MainWindow(QMainWindow):
         # ---- pages (tab bar hidden; the sidebar is the navigation) ----
         self.kept = Gallery("raw", self)
         self.disc = Gallery("discarded", self)
+        self.failed = Gallery("failed", self)
         self.stats = StatsTab()
         self.tabs = QTabWidget()
         self.tabs.addTab(self.kept, "Verified (kept)")
         self.tabs.addTab(self.disc, "Discarded")
+        self.tabs.addTab(self.failed, "Failed")
         self.tabs.addTab(self.stats, "Statistics")
         self.dups = DupTab(self)
         self.tabs.addTab(self.dups, "Duplicates")
         self.settings = SettingsTab(self)
         self.tabs.addTab(self.settings, "Settings")
         self.tabs.tabBar().hide()
-        for page in (self.kept, self.disc, self.stats, self.dups, self.settings):
+        for page in (self.kept, self.disc, self.failed, self.stats, self.dups, self.settings):
             page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.tabs.currentChanged.connect(self._on_tab)
 
@@ -1000,18 +1009,21 @@ class MainWindow(QMainWindow):
 
         # ---- detail panel ----
         self.preview = PreviewLabel("Select an image"); self.preview.setObjectName("preview")
-        self.d = {k: QLabel("-") for k in ("Age", "Emotion", "Gender", "Overlay", "Source", "File")}
+        self.d = {k: QLabel("-") for k in ("Age", "Emotion", "Gender", "Overlay", "Source", "File", "Error")}
         for v in self.d.values():
             v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); v.setWordWrap(True)
         dform = QFormLayout(); dform.setVerticalSpacing(6); dform.setContentsMargins(0, 8, 0, 0)
         for k, v in self.d.items():
             lab = QLabel(k); lab.setObjectName("muted"); dform.addRow(lab, v)
         self.act = QPushButton(); self.act.clicked.connect(self.move_selected)
+        self.retry_btn = QPushButton("↻  Retry labeling"); self.retry_btn.clicked.connect(self.retry_selected)
+        self.retry_btn.setToolTip("Send the selected failed image(s) to the VLM again.")
+        self.retry_btn.setVisible(False)
         self.open_btn = QPushButton("Open folder"); self.open_btn.clicked.connect(self.open_folder)
         self.hint = QLabel("Tip: Ctrl/Shift-click to select several images.")
         self.hint.setObjectName("muted"); self.hint.setWordWrap(True)
         dl = QVBoxLayout(); dl.setContentsMargins(16, 0, 0, 0); dl.setSpacing(10)
-        dl.addWidget(self.preview, 1); dl.addLayout(dform); dl.addWidget(self.act)
+        dl.addWidget(self.preview, 1); dl.addLayout(dform); dl.addWidget(self.retry_btn); dl.addWidget(self.act)
         dl.addWidget(self.open_btn); dl.addWidget(self.hint)
         detail = self.detail = QWidget(); detail.setLayout(dl); detail.setMinimumWidth(386); detail.setMaximumWidth(436)
 
@@ -1044,8 +1056,8 @@ class MainWindow(QMainWindow):
     def _on_tab(self, i: int):
         self.nav.blockSignals(True); self.nav.setCurrentRow(i); self.nav.blockSignals(False)
         self.title.setText(self.TITLES[i])
-        on_dups = i in (3, 4)                 # labeling controls are irrelevant on Duplicates / Settings
-        if i == 3 and not self.dups.loaded:
+        on_dups = i in (4, 5)                 # labeling controls are irrelevant on Duplicates / Settings
+        if i == 4 and not self.dups.loaded:
             self.dups.reload()
         keep = (self.auto_chk, self.refresh_btn, self.scan_btn)
         for k in range(self.opts.count()):
@@ -1095,7 +1107,7 @@ class MainWindow(QMainWindow):
         self._rev = self.db.rev()
         self._last_refresh = time.monotonic()
         if grids or force:
-            self.kept.refresh(force=force); self.disc.refresh(force=force)
+            self.kept.refresh(force=force); self.disc.refresh(force=force); self.failed.refresh(force=force)
             self._grid_stale = False
         else:
             self._grid_stale = True
@@ -1109,7 +1121,8 @@ class MainWindow(QMainWindow):
         n_dup = self.db.dups_pending_count()
         self.nav.item(0).setText(f"{self.NAV[0]}   ({t['kept']:,})")
         self.nav.item(1).setText(f"{self.NAV[1]}   ({t['discarded']:,})")
-        self.nav.item(3).setText(self.NAV[3] + (f"   ({n_dup:,})" if n_dup else ""))
+        self.nav.item(2).setText(f"{self.NAV[2]}   ({t['failed']:,})")
+        self.nav.item(4).setText(self.NAV[4] + (f"   ({n_dup:,})" if n_dup else ""))
         self.side_bar.setRange(0, max(t["total"], 1)); self.side_bar.setValue(t["labeled"])
         self.side_count.setText(f"{t['labeled']:,} / {t['total']:,}")
         self.statusBar().showMessage(f"{t['labeled']:,} labeled of {t['total']:,} images  ·  {t['unlabeled']:,} remaining")
@@ -1178,12 +1191,33 @@ class MainWindow(QMainWindow):
                 "--workers", str(self.workers.value())]
         if not self.move_chk.isChecked():
             args.append("--no-move")
+        self._launch(args, pe, self.n.value())
+
+    def retry_selected(self):
+        sel = self.failed.selected()
+        if not sel or self.dups.busy or (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning):
+            return
+        env = load_env()
+        if "UNSLOTH_API_KEY" not in env or "UNSLOTH_BASE_URL" not in env:
+            QMessageBox.warning(self, "Missing settings", "UNSLOTH_API_KEY / UNSLOTH_BASE_URL not found in .env")
+            return
+        pe = QProcessEnvironment.systemEnvironment()
+        for k, v in env.items():
+            pe.insert(k, v)
+        args = ["-u", "tools/vlm_label.py", "--workers", str(self.workers.value())]
+        if not self.move_chk.isChecked():
+            args.append("--no-move")
+        args += ["--paths"] + [r["path"] for r in sel]
+        self.log(f"Retrying {len(sel)} failed image(s)")
+        self._launch(args, pe, len(sel))
+
+    def _launch(self, args, pe, n):
         self.proc = QProcess(self)
         self.proc.setProcessEnvironment(pe); self.proc.setWorkingDirectory(str(REPO))
         self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self.on_output)
         self.proc.finished.connect(self.on_finished)
-        self.target_n = self.n.value()
+        self.target_n = n
         self._t0, self._done = time.monotonic(), 0
         self._tick.start(1000)
         self.progress.setRange(0, self.target_n); self.progress.setValue(0)
@@ -1194,7 +1228,7 @@ class MainWindow(QMainWindow):
 
     def set_running(self, running: bool):
         self.start.setEnabled(not running); self.stop.setEnabled(running)
-        for w in (self.n, self.seed, self.workers, self.move_chk, self.act):
+        for w in (self.n, self.seed, self.workers, self.move_chk, self.act, self.retry_btn):
             w.setEnabled(not running)
         self.dups._update_buttons()
 
@@ -1244,6 +1278,10 @@ class MainWindow(QMainWindow):
         self.act.setText(("↩  Restore to kept" if in_disc else "✕  Move to discarded") + (f" ({n})" if n else ""))
         self.act.setEnabled(n > 0 and not (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning))
         self.open_btn.setEnabled(n > 0)
+        self.retry_btn.setVisible(gallery is self.failed)
+        self.retry_btn.setText("↻  Retry labeling" + (f" ({n})" if n else ""))
+        self.retry_btn.setEnabled(n > 0 and not (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning)
+                                  and not self.dups.busy)
         if sig == self._shown:
             return                                              # same selection as before: nothing to reload
         self._shown = sig
@@ -1259,9 +1297,10 @@ class MainWindow(QMainWindow):
             self.log(f"cannot load image {r['path']}", "WARN")
         else:
             self.preview.set_image(pm)
-        self.d["Age"].setText(r["age"]); self.d["Emotion"].setText(r["emotion"])
-        self.d["Gender"].setText(r["gender"]); self.d["Overlay"].setText(r["overlay"] or "-")
+        self.d["Age"].setText(r["age"] or "-"); self.d["Emotion"].setText(r["emotion"] or "-")
+        self.d["Gender"].setText(r["gender"] or "-"); self.d["Overlay"].setText(r["overlay"] or "-")
         self.d["Source"].setText(r["source"]); self.d["File"].setText(r["path"])
+        self.d["Error"].setText((r.get("raw") or "-") if gallery is self.failed else "-")
         if n > 1:
             self.d["File"].setText(f"{r['path']}  (+{n - 1} more selected)")
 
@@ -1275,7 +1314,7 @@ class MainWindow(QMainWindow):
         sel = gallery.selected()
         if not sel:
             return
-        to_disc = gallery is self.kept
+        to_disc = gallery is not self.disc            # kept and failed images go to discarded
         mapping = {}
         missing = [r["path"] for r in sel if not (DATA / r["path"]).exists()]
         for r in sel:
@@ -1305,7 +1344,7 @@ class MainWindow(QMainWindow):
         for pr in (self.proc, self.dups.proc):
             if pr and pr.state() != QProcess.ProcessState.NotRunning:
                 pr.kill(); pr.waitForFinished(2000)
-        for g in (self.kept, self.disc):
+        for g in (self.kept, self.disc, self.failed):
             g.shutdown()
         if self.dups._tbatch:
             self.dups._tbatch.cancel()
