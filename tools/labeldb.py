@@ -112,6 +112,13 @@ class LabelDB:
                           " WHERE path=?", (r["age"], r["emotion"], r["gender"], r["overlay"], int(r["valid"]),
                                             r["raw"], seq, r["path"]))
 
+    def reset_labels(self, loc: str = "raw") -> int:
+        """Erase all VLM labels of the images in `loc` (back to 'not labeled yet'). Files are not touched."""
+        with self.tx() as c:
+            n = c.execute("UPDATE images SET age=NULL,emotion=NULL,gender=NULL,overlay=NULL,valid=NULL,raw=NULL,seq=NULL"
+                          " WHERE loc=? AND valid IS NOT NULL", (loc,)).rowcount
+        return n
+
     def move_paths(self, mapping: Dict[str, str]) -> None:
         if not mapping:
             return

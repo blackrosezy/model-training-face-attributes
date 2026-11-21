@@ -33,10 +33,10 @@ def find(data_dir: Path, finder: str, params: Dict, limit: int, progress: Callab
     ordered = sorted(groups, key=lambda g: g.members[0])
     for n, (gid, g) in enumerate(enumerate(ordered, offset + 1), 1):
         info = {m: describe(data_dir, m) for m in g.members}            # each file opened once
-        keep = pick_keeper(data_dir, g.members, info)
+        keep = set(g.keep) if g.keep else {pick_keeper(data_dir, g.members, info)}
         for m in g.members:
             w, h, size = info[m]
-            rows.append({"group_id": str(gid), "image": m, "keeper": "1" if m == keep else "0",
+            rows.append({"group_id": str(gid), "image": m, "keeper": "1" if m in keep else "0",
                          "score": f"{g.score:.4f}", "finder": finder, "status": "pending", "moved_to": "",
                          "width": w, "height": h, "bytes": size})
         if n % 20 == 0 or n == len(ordered):

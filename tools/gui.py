@@ -4,7 +4,7 @@ Run from anywhere:  python tools/gui.py
 Needs UNSLOTH_BASE_URL / UNSLOTH_API_KEY in .env (same as the CLI).
 """
 import hashlib, html, os, shutil, sys, time, traceback
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -12,10 +12,10 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # so `import dedup` works from anywhere
 from dedup import registry as dedup_registry, store as dedup_store
 from labeldb import LabelDB
-from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QAbstractListModel, QItemSelectionModel, QModelIndex, QObject, QProcess, QProcessEnvironment, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QImageReader, QPainter, QPalette, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QSizePolicy, QCheckBox, QDoubleSpinBox, QGridLayout, QComboBox, QLineEdit, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QApplication, QSizePolicy, QCheckBox, QDoubleSpinBox, QGridLayout, QComboBox, QLineEdit, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListView, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
     QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -23,8 +23,7 @@ from PyQt6.QtWidgets import (
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 CLASSES = yaml.safe_load((DATA / "configs" / "classes.yaml").read_text())
-OVERLAYS = ["text", "logo_brand", "watermark"]
-PAGE = 120
+OVERLAYS = ["text", "logo_brand", "watermark", "illustration", "cartoon", "3d_render", "multiple_faces"]
 LOG_FILE = REPO / "gui.log"
 LOG_COLORS = {"INFO": "#222", "OK": "#1b7a2b", "WARN": "#b26a00", "ERROR": "#c62828", "PROC": "#555"}
 THUMB = 150
@@ -237,8 +236,8 @@ class ThumbLoader:
         self.pool.setMaxThreadCount(8)
         self.sig = _Signals()
 
-    def request(self, rel: str, size: int, batch: Batch):
-        self.pool.start(_Task(rel, size, batch, self.sig))
+    def request(self, rel: str, size: int, batch: Batch, priority: int = 0):
+        self.pool.start(_Task(rel, size, batch, self.sig), priority)       # higher priority runs first
 
 
 _loader = None
@@ -294,13 +293,111 @@ class PreviewLabel(QLabel):
         return QSize(340, 340)
 
 
+class GalleryModel(QAbstractListModel):
+    """Virtual list: rowCount is the TOTAL number of matching images, but only what is on screen is ever loaded.
+      - row data (small dicts) is fetched from SQLite one CHUNK at a time, on demand, in an LRU of MAX_CHUNKS chunks;
+      - thumbnails are decoded only when a row is painted (= visible) and kept in an LRU of MAX_ICONS;
+      - thumbnail jobs run newest-first and are cancelled when their row has been scrolled far away.
+    So memory stays flat however far you scroll (the decoded 150px thumbs are also cached on disk)."""
+    CHUNK, MAX_CHUNKS, MAX_ICONS = 200, 30, 400
+
+    def __init__(self, gallery):
+        super().__init__(gallery)
+        self.g = gallery
+        self.total, self.filters = 0, None
+        self.chunks, self.icons, self.pending, self.failed = OrderedDict(), OrderedDict(), {}, set()
+        self.prio = 0
+
+    # ---- model API ----
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else self.total
+
+    def row_data(self, row: int):
+        if not 0 <= row < self.total:
+            return None
+        ci, off = divmod(row, self.CHUNK)
+        ch = self.chunks.get(ci)
+        if ch is None:
+            ch = self.g.win.db.page(self.g.loc, self.filters, self.CHUNK, ci * self.CHUNK)
+            self.chunks[ci] = ch
+            while len(self.chunks) > self.MAX_CHUNKS:
+                self.chunks.popitem(last=False)
+        else:
+            self.chunks.move_to_end(ci)
+        return ch[off] if off < len(ch) else None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        r = self.row_data(index.row())
+        if r is None:
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            return short_label(r)
+        if role == Qt.ItemDataRole.UserRole:
+            return r
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return int(Qt.AlignmentFlag.AlignHCenter)
+        if role == Qt.ItemDataRole.DecorationRole:
+            path = r["path"]
+            ic = self.icons.get(path)
+            if ic is not None:
+                self.icons.move_to_end(path)
+                return ic
+            if path not in self.pending and path not in self.failed:      # painted = visible -> load it
+                batch = Batch()
+                self.pending[path] = (batch, index.row())
+                self.prio += 1
+                thumbs().request(path, THUMB, batch, self.prio)
+            return placeholder(THUMB)
+        return None
+
+    # ---- thumbnails ----
+    def thumb_ready(self, rel: str, size: int, img: QImage):
+        ent = self.pending.pop(rel, None)
+        if ent is None or size != THUMB:
+            return
+        if img.isNull():
+            self.failed.add(rel)
+            return
+        self.icons[rel] = QIcon(QPixmap.fromImage(img))
+        while len(self.icons) > self.MAX_ICONS:
+            self.icons.popitem(last=False)
+        if ent[1] < self.total:
+            ix = self.index(ent[1])
+            self.dataChanged.emit(ix, ix, [Qt.ItemDataRole.DecorationRole])
+
+    def cancel_outside(self, lo: int, hi: int):
+        for path, (batch, row) in list(self.pending.items()):
+            if row < lo or row > hi:
+                batch.cancel(); del self.pending[path]
+
+    def cancel_all(self):
+        self.cancel_outside(1, 0)
+
+    # ---- changes ----
+    def reset(self, total: int, filters: dict, keep_chunks: bool = False):
+        self.beginResetModel()
+        self.cancel_all()
+        if not keep_chunks:
+            self.chunks.clear()
+        self.total, self.filters = total, dict(filters)
+        self.endResetModel()
+
+    def grow(self, total: int):
+        self.beginInsertRows(QModelIndex(), self.total, total - 1)
+        self.total = total
+        self.endInsertRows()
+
+
 class Gallery(QWidget):
-    """Filterable, paged thumbnail grid for one location (raw = kept, discarded). Data comes from SQLite."""
+    """Filterable, infinitely scrolling thumbnail grid for one location (raw = kept, discarded).
+    Virtualized (see GalleryModel): nothing is paged, memory does not grow with the scroll distance."""
 
     def __init__(self, loc: str, win):
         super().__init__()
         self.loc, self.win = loc, win
-        self.page, self.items, self.batch, self._last, self._quiet = 0, {}, None, None, False
+        self._quiet = False
 
         self.f_age, self.f_emo, self.f_gen = (QComboBox() for _ in range(3))
         for box, key in ((self.f_age, "age"), (self.f_emo, "emotion"), (self.f_gen, "gender")):
@@ -318,40 +415,34 @@ class Gallery(QWidget):
             top.addWidget(QLabel(text)); top.addWidget(box)
         top.addStretch()
 
-        self.grid = QListWidget()
-        self.grid.setViewMode(QListWidget.ViewMode.IconMode)
-        self.grid.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.grid.setMovement(QListWidget.Movement.Static)
+        self.model = GalleryModel(self)
+        self.grid = QListView()
+        self.grid.setModel(self.model)
+        self.grid.setViewMode(QListView.ViewMode.IconMode)
+        self.grid.setResizeMode(QListView.ResizeMode.Adjust)
+        self.grid.setMovement(QListView.Movement.Static)
+        self.grid.setUniformItemSizes(True)
         self.grid.setIconSize(QSize(THUMB, THUMB))
         self.grid.setGridSize(QSize(THUMB + 46, THUMB + 42))
         self.grid.setWordWrap(True)
-        self.grid.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.grid.itemSelectionChanged.connect(self._sel_changed)
-
-        self.prev, self.next = QPushButton("◀ Prev"), QPushButton("Next ▶")
-        self.prev.clicked.connect(lambda: self._go(-1))
-        self.next.clicked.connect(lambda: self._go(1))
+        self.grid.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
+        self.grid.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        self.grid.verticalScrollBar().setSingleStep(40)
+        self.grid.selectionModel().selectionChanged.connect(lambda *_: self._sel_changed())
+        self.grid.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self.info = QLabel()
-        bottom = QHBoxLayout()
-        bottom.addWidget(self.prev); bottom.addWidget(self.info, 1, Qt.AlignmentFlag.AlignCenter)
-        bottom.addWidget(self.next)
 
         lay = QVBoxLayout(self)
-        lay.addLayout(top); lay.addWidget(self.grid, 1); lay.addLayout(bottom)
-        thumbs().sig.done.connect(self._thumb_ready)
+        lay.addLayout(top); lay.addWidget(self.grid, 1); lay.addWidget(self.info, 0, Qt.AlignmentFlag.AlignCenter)
+        thumbs().sig.done.connect(self.model.thumb_ready)
 
-    # ---- filters / paging ----
+    # ---- filters ----
     def filters(self) -> dict:
         return {"age": self.f_age.currentText(), "emotion": self.f_emo.currentText(),
                 "gender": self.f_gen.currentText(), "source": self.f_src.currentText(),
                 "overlay": self.f_ovl.currentText()}
 
     def _filters_changed(self):
-        self.page = 0
-        self.refresh(force=True)
-
-    def _go(self, d):
-        self.page += d
         self.refresh(force=True)
 
     def _sel_changed(self):
@@ -368,71 +459,62 @@ class Gallery(QWidget):
                 self.f_src.setCurrentText(cur)
             self.f_src.blockSignals(False)
 
-    # ---- data: SQL query for ONE page; in-place update so scroll position and selection survive ----
+    def _on_scroll(self, v: int):
+        """Drop thumbnail jobs for rows that were scrolled far out of sight (keeps the queue short)."""
+        g = self.grid.gridSize()
+        cols = max(1, self.grid.viewport().width() // g.width())
+        lo = max(0, (v // g.height() - 1) * cols)
+        hi = ((v + self.grid.viewport().height()) // g.height() + 2) * cols
+        self.model.cancel_outside(lo, hi)
+
+    # ---- data: only the row COUNT is queried here; rows are fetched lazily by the model ----
     def refresh(self, force: bool = False):
-        db = self.win.db
+        db, m = self.win.db, self.model
         self._sync_sources()
         f = self.filters()
         total = db.count(self.loc, f)
-        pages = max(1, -(-total // PAGE))
-        self.page = min(self.page, pages - 1)
-        rows = db.page(self.loc, f, PAGE, self.page * PAGE)
-        key = (tuple(sorted(f.items())), self.page)
         self._quiet = True
-        self.grid.setUpdatesEnabled(False)
         try:
-            if force or key != self._last:
-                self._rebuild(rows)
+            if f != m.filters:                                     # new filter: start from the top
+                m.reset(total, f)
+                self.grid.verticalScrollBar().setValue(0)
             else:
-                self._diff(rows)
+                changed, appended = False, False
+                for ci, old in list(m.chunks.items()):             # re-read only the chunks we hold
+                    new = db.page(self.loc, f, m.CHUNK, ci * m.CHUNK)
+                    if new == old:
+                        continue
+                    if total > m.total and new[:len(old)] == old:  # new images were appended after them
+                        m.chunks[ci] = new; appended = True
+                    else:
+                        m.chunks[ci] = new; changed = True
+                if changed or total < m.total:                     # rows moved/removed: rows shift -> keep selection by path
+                    keep = {r["path"] for r in self.selected()}
+                    pos = self.grid.verticalScrollBar().value()
+                    m.reset(total, f, keep_chunks=True)
+                    self._restore(keep, pos)
+                elif total > m.total or appended:
+                    m.grow(total)
         finally:
-            self.grid.setUpdatesEnabled(True)
             self._quiet = False
-        self._last = key
-        self.info.setText(f"{total:,} images  ·  page {self.page + 1} / {pages}")
-        self.prev.setEnabled(self.page > 0)
-        self.next.setEnabled(self.page + 1 < pages)
+        self.info.setText(f"{total:,} images  ·  scroll for more")
         self._sel_changed()
 
-    def _add(self, r: dict):
-        it = QListWidgetItem(placeholder(THUMB), short_label(r))
-        it.setData(Qt.ItemDataRole.UserRole, r)
-        it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self.grid.addItem(it)
-        self.items[r["path"]] = it
-        thumbs().request(r["path"], THUMB, self.batch)
-
-    def _rebuild(self, rows):
-        if self.batch:
-            self.batch.cancel()
-        self.batch = Batch()
-        self.grid.clear(); self.items = {}
-        for r in rows:
-            self._add(r)
-
-    def _diff(self, rows):
-        new = {r["path"] for r in rows}
-        for path in [p for p in self.items if p not in new]:     # moved away / relabeled
-            self.grid.takeItem(self.grid.row(self.items.pop(path)))
-        for r in rows:                                           # freshly labeled images are appended
-            if r["path"] not in self.items:
-                self._add(r)
-
-    def _thumb_ready(self, rel: str, size: int, img: QImage):
-        it = self.items.get(rel)
-        if it is None or size != THUMB or img.isNull():
-            return
-        try:
-            it.setIcon(QIcon(QPixmap.fromImage(img)))
-        except RuntimeError:                                     # item deleted meanwhile
-            pass
+    def _restore(self, paths: set, pos: int):
+        m, sm = self.model, self.grid.selectionModel()
+        if paths:
+            for ci, ch in m.chunks.items():
+                for off, r in enumerate(ch):
+                    if r["path"] in paths:
+                        sm.select(m.index(ci * m.CHUNK + off), QItemSelectionModel.SelectionFlag.Select)
+        QTimer.singleShot(0, lambda: self.grid.verticalScrollBar().setValue(pos))
 
     def selected(self) -> list:
-        return [i.data(Qt.ItemDataRole.UserRole) for i in self.grid.selectedItems()]
+        rows = sorted(i.row() for i in self.grid.selectionModel().selectedIndexes())
+        return [r for r in map(self.model.row_data, rows) if r]
 
     def shutdown(self):
-        if self.batch:
-            self.batch.cancel()
+        self.model.cancel_all()
 
 
 class BarChart(QWidget):
@@ -498,7 +580,7 @@ class StatsTab(QWidget):
         grid = QGridLayout()
         specs = (("Age", "age", CLASSES["age"], "#0078d7"), ("Emotion", "emotion", CLASSES["emotion"], "#0063b1"),
                  ("Gender", "gender", CLASSES["gender"], "#2b88d8"),
-                 ("Overlay (text / brand)", "overlay", ["none"] + OVERLAYS, "#c42b1c"))
+                 ("Overlay / not a photo", "overlay", ["none"] + OVERLAYS, "#c42b1c"))
         for i, (title, key, order, color) in enumerate(specs):
             box = QGroupBox(title); chart = BarChart(order, color)
             QVBoxLayout(box).addWidget(chart)
@@ -547,6 +629,9 @@ class DupTab(QWidget):
             self.finder.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
             if miss:
                 self.finder.model().item(i).setEnabled(False)
+        default = self.finder.findData("torch_gpu")                  # fast exact-duplicate search is the default
+        if default >= 0:
+            self.finder.setCurrentIndex(default)
         self.finder.currentIndexChanged.connect(self._build_params)
         self.param_box = QHBoxLayout(); self.param_box.setSpacing(8)
         self.limit = QSpinBox(); self.limit.setRange(0, 200000); self.limit.setFixedWidth(92)
@@ -724,6 +809,12 @@ class DupTab(QWidget):
 
     # ---- actions run through the command-line tool, so the GUI never freezes ----
     def find(self):
+        cls = dedup_registry.available().get(self.finder.currentData())
+        if cls and cls.slow and self.limit.value() == 0:
+            if QMessageBox.question(self, "Slow method", f"'{cls.name}' is slow (hours on the whole dataset) and loads "
+                    "the GPU and disk heavily. Tip: set Limit to a few hundred for a quick test.\n\nRun on ALL "
+                    "images?") != QMessageBox.StandardButton.Yes:
+                return
         if self.limit.value() == 0 and self.pending_remove:
             if QMessageBox.question(self, "Replace results?", f"{self.pending_remove:,} pending duplicates from the "
                     "previous search will be replaced by the new search. Continue?") != QMessageBox.StandardButton.Yes:
@@ -790,9 +881,27 @@ class DupTab(QWidget):
         self._update_buttons()
 
 
+class SettingsTab(QWidget):
+    """Rarely used, destructive actions live here (not in the main header) so they cannot be clicked by accident."""
+
+    def __init__(self, win):
+        super().__init__()
+        box = QWidget(); box.setObjectName("card")
+        title = QLabel("Reset verified labels"); title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        text = QLabel("Erase the age, emotion and gender labels of all verified images so they can be labeled again "
+                      "from scratch. Image files are not moved or deleted, and discarded images are not touched. "
+                      "You will be asked to confirm.")
+        text.setWordWrap(True); text.setObjectName("muted")
+        self.reset_btn = QPushButton("Reset labels…")
+        self.reset_btn.clicked.connect(win.reset_verified)
+        bl = QVBoxLayout(box); bl.addWidget(title); bl.addWidget(text)
+        row = QHBoxLayout(); row.addWidget(self.reset_btn); row.addStretch(); bl.addLayout(row)
+        lay = QVBoxLayout(self); lay.addWidget(box); lay.addStretch(1)
+
+
 class MainWindow(QMainWindow):
-    NAV = ["✔   Verified", "✕   Discarded", "▥   Statistics", "▣   Duplicates"]
-    TITLES = ["Verified images", "Discarded images", "Statistics", "Duplicate images"]
+    NAV = ["✔   Verified", "✕   Discarded", "▥   Statistics", "▣   Duplicates", "⚙   Settings"]
+    TITLES = ["Verified images", "Discarded images", "Statistics", "Duplicate images", "Settings"]
 
     def __init__(self):
         super().__init__()
@@ -816,7 +925,7 @@ class MainWindow(QMainWindow):
         self.workers.setToolTip("Parallel requests to the VLM server.")
         for sp in (self.n, self.seed, self.workers):
             sp.setFixedWidth(92)
-        self.move_chk = QCheckBox("Discard overlay images"); self.move_chk.setChecked(True)
+        self.move_chk = QCheckBox("Discard overlay / non-photo images"); self.move_chk.setChecked(True)
         self.start = QPushButton("Start labeling"); self.start.setObjectName("start")
         self.stop = QPushButton("Stop"); self.stop.setObjectName("stop"); self.stop.setEnabled(False)
         self.start.clicked.connect(self.start_run)
@@ -853,8 +962,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.stats, "Statistics")
         self.dups = DupTab(self)
         self.tabs.addTab(self.dups, "Duplicates")
+        self.settings = SettingsTab(self)
+        self.tabs.addTab(self.settings, "Settings")
         self.tabs.tabBar().hide()
-        for page in (self.kept, self.disc, self.stats, self.dups):
+        for page in (self.kept, self.disc, self.stats, self.dups, self.settings):
             page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.tabs.currentChanged.connect(self._on_tab)
 
@@ -933,8 +1044,8 @@ class MainWindow(QMainWindow):
     def _on_tab(self, i: int):
         self.nav.blockSignals(True); self.nav.setCurrentRow(i); self.nav.blockSignals(False)
         self.title.setText(self.TITLES[i])
-        on_dups = i == 3                      # labeling controls are irrelevant there
-        if on_dups and not self.dups.loaded:
+        on_dups = i in (3, 4)                 # labeling controls are irrelevant on Duplicates / Settings
+        if i == 3 and not self.dups.loaded:
             self.dups.reload()
         keep = (self.auto_chk, self.refresh_btn, self.scan_btn)
         for k in range(self.opts.count()):
@@ -1029,6 +1140,25 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.status.setText("Scan finished" if code == 0 else "Scan failed (see console)")
         self.log("Scan finished" if code == 0 else f"Scan failed (exit code {code})", "OK" if code == 0 else "ERROR")
+        self.refresh(force=True)
+
+    def reset_verified(self):
+        busy = (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning) or self.dups.busy
+        if busy:
+            QMessageBox.information(self, "Busy", "A job is running. Wait for it or press Stop first.")
+            return
+        n = self.db.count("raw", {})
+        if QMessageBox.warning(
+                self, "Reset verified labels",
+                f"This will ERASE the age, emotion and gender labels of all {n:,} verified images.\n"
+                "They go back to 'not labeled yet' and will be labeled again the next time you press Start labeling.\n\n"
+                "Image files are not moved or deleted, and discarded images are not touched.\n"
+                "This cannot be undone. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        done = self.db.reset_labels("raw")
+        self.log(f"Reset labels of {done:,} verified images", "OK")
         self.refresh(force=True)
 
     # ---- labeling process ----

@@ -24,6 +24,7 @@ class DupGroup:
     """Images judged to be the same picture. Paths are relative to the data dir (e.g. raw/ffhq/ffhq_000001.png)."""
     members: List[str]
     score: float = 1.0          # weakest similarity linking the group (1.0 = identical)
+    keep: Optional[List[str]] = None   # finder-chosen survivors (several allowed); None = pipeline keeps 1 (pick_keeper)
 
 
 class DuplicateFinder(ABC):
@@ -36,6 +37,7 @@ class DuplicateFinder(ABC):
     description: str = ""
     requires: tuple = ()                         # importable module names, e.g. ("faiss", "torch")
     install_hint: str = ""                       # shown when a requirement is missing
+    slow: bool = False                           # True = GUI asks for confirmation before a full (no --limit) run
     hidden: bool = False                         # True = not offered in the GUI (still usable from the CLI)
     params: Dict[str, Param] = {}
 

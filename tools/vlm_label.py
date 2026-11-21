@@ -1,7 +1,8 @@
-"""Label images with the Unsloth VLM and discard images with text/brand overlays, in one pass.
+"""Label images with the Unsloth VLM and discard images with text/brand overlays or that are not real photos
+(illustration / cartoon / 3D render), in one pass.
 
 Legacy folder labels are never used. Resumable; results go to the label database (tools/labeldb.py).
-Images flagged with an overlay are moved from data/raw/<src>/ to data/discarded/<src>/
+Images flagged (overlay, more than one face, or not a real photo: stored in the same `overlay` field) are moved from data/raw/<src>/ to data/discarded/<src>/
 and the database is updated to the new path.
 
 Usage: python tools/vlm_label.py --n 100 [--seed 0] [--workers 4] [--no-move]
@@ -20,6 +21,7 @@ ROOT = Path("data")
 MODEL = "unsloth/Qwen3.5-9B-GGUF"
 CLASSES = yaml.safe_load((ROOT / "configs/classes.yaml").read_text())
 OVERLAY = ["none", "text", "logo_brand", "watermark"]
+STYLES = ["photo", "illustration", "cartoon", "3d_render"]      # non-photo styles are stored in `overlay` -> discarded
 
 PROMPT = (
     "Look at this image of a face. FIRST inspect it for any overlay that was ADDED ON TOP of the photo after it was taken: "
@@ -27,9 +29,19 @@ PROMPT = (
     "on the image, or text/captions/subtitles.\n"
     "Do NOT count things that were physically part of the photographed scene, such as lettering or "
     "logos on clothing, hats, signs, badges or products.\n"
-    "Then classify age, emotion, gender.\n"
+    "NEXT decide whether this is a REAL PHOTOGRAPH of a real person (image_type):\n"
+    "- photo: a real camera photograph, even if black-and-white, filtered, retouched, blurry or low quality.\n"
+    "- illustration: a drawing, painting, sketch, line art or vector illustration.\n"
+    "- cartoon: a cartoon, anime, manga or comic character.\n"
+    "- 3d_render: a computer-generated 3D model/CGI/video-game character, doll or mannequin-like render.\n"
+    "THEN count the distinct human faces visible in the image (face_count). Count every face, including small, partial, "
+    "background, reflected or printed faces (e.g. on a poster or photo), not just the main subject.\n"
+    "Then classify age, emotion, gender (for the main/largest face).\n"
     "Reply with ONLY a JSON object, keys in this order:\n"
     + json.dumps({"overlay_evidence": "short description of any added watermark/logo/text and where, or 'nothing'",
+                  "style_evidence": "one short phrase on why this is or is not a real photograph",
+                  "image_type": "one of " + json.dumps(STYLES),
+                  "face_count": "integer number of distinct faces visible",
                   **{t: "one of " + json.dumps(c) for t, c in CLASSES.items()},
                   "overlay": "one of " + json.dumps(OVERLAY)}, indent=1)
 )
@@ -52,9 +64,18 @@ def label(rel: str) -> dict:
     except Exception as e:
         return {"path": rel, "age": None, "emotion": None, "gender": None, "overlay": None,
                 "valid": 0, "raw": f"ERR {type(e).__name__}: {e} | {raw}"[:500]}
-    ok = all(d.get(t) in CLASSES[t] for t in CLASSES) and d.get("overlay") in OVERLAY
+    ok = all(d.get(t) in CLASSES[t] for t in CLASSES) and d.get("overlay") in OVERLAY and d.get("image_type") in STYLES
+    overlay = d.get("overlay")
+    if ok and overlay == "none" and d["image_type"] != "photo":
+        overlay = d["image_type"]                       # illustration / cartoon / 3d_render -> flagged like an overlay
+    try:
+        faces = int(d.get("face_count"))
+    except (TypeError, ValueError):
+        faces = 1                                       # missing/garbled count: do not discard on it
+    if ok and overlay == "none" and faces > 1:
+        overlay = "multiple_faces"                      # more than one face -> flagged like an overlay
     return {"path": rel, "age": d.get("age"), "emotion": d.get("emotion"), "gender": d.get("gender"),
-            "overlay": d.get("overlay"), "valid": int(ok), "raw": raw.replace("\n", " ")[:500]}
+            "overlay": overlay, "valid": int(ok), "raw": raw.replace("\n", " ")[:500]}
 
 def main():
     ap = argparse.ArgumentParser()
