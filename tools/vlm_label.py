@@ -97,28 +97,31 @@ def main():
         random.Random(a.seed).shuffle(todo)
         todo = todo[: a.n]
 
-    results, batch = [], []
+    def move_flagged(rows):
+        """Move overlay / multiple-face / non-photo images to data/discarded/ right after they are labeled."""
+        moved = {}
+        for r in rows:
+            if r["valid"] != 1 or r["overlay"] == "none":
+                continue
+            new_rel = "discarded/" + r["path"].split("/", 1)[1]      # raw/<src>/x -> discarded/<src>/x
+            dst = ROOT / new_rel; dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(ROOT / r["path"], dst); moved[r["path"]] = new_rel
+        db.move_paths(moved)
+        return len(moved)
+
+    results, n_moved = [], 0
     with ThreadPoolExecutor(a.workers) as ex:
         for i, row in enumerate(ex.map(label, todo), 1):
-            results.append(row); batch.append(row)
-            if len(batch) >= 5:                                 # small batches: live in the GUI, cheap on the DB
-                db.set_labels(batch); batch = []
+            results.append(row)
+            db.set_labels([row])                                # one image at a time: a stopped run loses nothing
+            if not a.no_move: n_moved += move_flagged([row])    # flagged -> discarded immediately
             if i % 10 == 0: print(f"{i}/{len(todo)}", flush=True)
-    if batch:
-        db.set_labels(batch)
 
     flagged = [r for r in results if r["valid"] == 1 and r["overlay"] != "none"]
     print(f"labeled {len(results)}, invalid {sum(r['valid']==0 for r in results)}, "
           f"overlay-flagged {len(flagged)}")
-    if a.no_move or not flagged:
-        return
-    moved = {}
-    for r in flagged:
-        new_rel = "discarded/" + r["path"].split("/", 1)[1]      # raw/<src>/x -> discarded/<src>/x
-        dst = ROOT / new_rel; dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(ROOT / r["path"], dst); moved[r["path"]] = new_rel
-    db.move_paths(moved)
-    print(f"moved {len(moved)} images to data/discarded/")
+    if n_moved:
+        print(f"moved {n_moved} images to data/discarded/")
 
 
 if __name__ == "__main__":

@@ -952,6 +952,10 @@ class MainWindow(QMainWindow):
                                  "Fast: only folders that changed since the last scan are re-listed.")
         self.scan_btn.clicked.connect(self.scan_new)
         self.scan_proc = None
+        self.sweep_btn = QPushButton("Sweep flagged")
+        self.sweep_btn.setToolTip("Move images that are flagged (overlay, multiple faces, not a photo) but still in data/raw/ "
+                                  "to data/discarded/.")
+        self.sweep_btn.clicked.connect(self.sweep_flagged)
         self.auto_chk = QCheckBox("Auto refresh images")
         self.auto_chk.setChecked(True)
         self.auto_chk.setToolTip("Only affects the image grids (Verified / Discarded). Statistics, counts and the "
@@ -1004,7 +1008,7 @@ class MainWindow(QMainWindow):
         for label, w in (("Images", self.n), ("Seed", self.seed), ("Workers", self.workers)):
             lab = QLabel(label); lab.setObjectName("muted"); opts.addWidget(lab); opts.addWidget(w); opts.addSpacing(8)
         opts.addWidget(self.move_chk); opts.addStretch(); opts.addWidget(self.auto_chk)
-        opts.addWidget(self.scan_btn); opts.addWidget(self.refresh_btn)
+        opts.addWidget(self.sweep_btn); opts.addWidget(self.scan_btn); opts.addWidget(self.refresh_btn)
         prow = self.prow = QHBoxLayout(); prow.addWidget(self.progress, 1); prow.addWidget(self.status)
 
         # ---- detail panel ----
@@ -1019,11 +1023,12 @@ class MainWindow(QMainWindow):
         self.retry_btn = QPushButton("↻  Retry labeling"); self.retry_btn.clicked.connect(self.retry_selected)
         self.retry_btn.setToolTip("Send the selected failed image(s) to the VLM again.")
         self.retry_btn.setVisible(False)
+        self.raw_btn = QPushButton(); self.raw_btn.clicked.connect(self.back_to_raw)
         self.open_btn = QPushButton("Open folder"); self.open_btn.clicked.connect(self.open_folder)
         self.hint = QLabel("Tip: Ctrl/Shift-click to select several images.")
         self.hint.setObjectName("muted"); self.hint.setWordWrap(True)
         dl = QVBoxLayout(); dl.setContentsMargins(16, 0, 0, 0); dl.setSpacing(10)
-        dl.addWidget(self.preview, 1); dl.addLayout(dform); dl.addWidget(self.retry_btn); dl.addWidget(self.act)
+        dl.addWidget(self.preview, 1); dl.addLayout(dform); dl.addWidget(self.retry_btn); dl.addWidget(self.act); dl.addWidget(self.raw_btn)
         dl.addWidget(self.open_btn); dl.addWidget(self.hint)
         detail = self.detail = QWidget(); detail.setLayout(dl); detail.setMinimumWidth(386); detail.setMaximumWidth(436)
 
@@ -1155,6 +1160,26 @@ class MainWindow(QMainWindow):
         self.log("Scan finished" if code == 0 else f"Scan failed (exit code {code})", "OK" if code == 0 else "ERROR")
         self.refresh(force=True)
 
+    def sweep_flagged(self):
+        if (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning) or self.dups.busy:
+            QMessageBox.information(self, "Busy", "A job is running. Wait for it or press Stop first.")
+            return
+        rows = self.db.c.execute("SELECT path FROM images WHERE loc='raw' AND valid=1 AND overlay IS NOT NULL "
+                                 "AND overlay!='none'").fetchall()
+        mapping, errors = {}, 0
+        for (old,) in rows:
+            new = "discarded/" + old.split("/", 1)[1]
+            try:
+                (DATA / new).parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(DATA / old, DATA / new); mapping[old] = new
+            except OSError as e:
+                errors += 1; self.log(f"could not move {old}: {e}", "ERROR")
+        if mapping:
+            self.db.move_paths(mapping)
+        self.log(f"Swept {len(mapping)} flagged image(s) to discarded/" + (f", {errors} failed" if errors else ""), "OK")
+        self.statusBar().showMessage(f"Swept {len(mapping)} flagged image(s) to discarded", 6000)
+        self.refresh(force=True)
+
     def reset_verified(self):
         busy = (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning) or self.dups.busy
         if busy:
@@ -1228,7 +1253,7 @@ class MainWindow(QMainWindow):
 
     def set_running(self, running: bool):
         self.start.setEnabled(not running); self.stop.setEnabled(running)
-        for w in (self.n, self.seed, self.workers, self.move_chk, self.act, self.retry_btn):
+        for w in (self.n, self.seed, self.workers, self.move_chk, self.sweep_btn, self.act, self.retry_btn, self.raw_btn):
             w.setEnabled(not running)
         self.dups._update_buttons()
 
@@ -1278,6 +1303,11 @@ class MainWindow(QMainWindow):
         self.act.setText(("↩  Restore to kept" if in_disc else "✕  Move to discarded") + (f" ({n})" if n else ""))
         self.act.setEnabled(n > 0 and not (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning))
         self.open_btn.setEnabled(n > 0)
+        self.raw_btn.setVisible(gallery is not self.failed)
+        self.raw_btn.setText(("↺  Move back to raw, unverified" if in_disc else "↺  Unverify (back to unlabeled)")
+                             + (f" ({n})" if n else ""))
+        self.raw_btn.setEnabled(n > 0 and not (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning)
+                                and not self.dups.busy)
         self.retry_btn.setVisible(gallery is self.failed)
         self.retry_btn.setText("↻  Retry labeling" + (f" ({n})" if n else ""))
         self.retry_btn.setEnabled(n > 0 and not (self.proc and self.proc.state() != QProcess.ProcessState.NotRunning)
@@ -1308,6 +1338,40 @@ class MainWindow(QMainWindow):
         sel = self._gallery().selected()
         if sel:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str((DATA / sel[0]["path"]).parent)))
+
+    def back_to_raw(self):
+        """Verified: erase the labels so the image is unverified again. Discarded: move the file back to raw/ and
+        erase its labels too (it has to be verified again). Works on the whole selection; no confirmation."""
+        gallery = self._gallery()
+        sel = gallery.selected()
+        if not sel or gallery is self.failed:
+            return
+        from_disc = gallery is self.disc
+        paths, mapping, errors = [], {}, 0
+        for r in sel:
+            old = r["path"]
+            if not from_disc:
+                paths.append(old); continue
+            new = "raw/" + old.split("/", 1)[1]
+            try:
+                if not (DATA / old).exists():
+                    raise FileNotFoundError("file no longer exists")
+                (DATA / new).parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(DATA / old, DATA / new)
+                mapping[old] = new; paths.append(new)
+                self.log(f"moved {old} -> {new}")
+            except OSError as e:
+                errors += 1
+                self.log(f"could not move {old}: {e}", "ERROR")
+        if mapping:
+            self.db.move_paths(mapping)
+        n = self.db.unlabel(paths)
+        self.log(f"{n} image(s) are unverified again" + (" (moved back to raw/)" if from_disc else ""), "OK")
+        self.refresh()
+        msg = f"{n} image(s) are 'not labeled' again"
+        if errors:
+            msg += f"  ·  {errors} could not be moved (see log)"
+        self.statusBar().showMessage(msg, 6000)
 
     def move_selected(self):
         gallery = self._gallery()

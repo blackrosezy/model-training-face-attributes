@@ -119,6 +119,16 @@ class LabelDB:
                           " WHERE loc=? AND valid IS NOT NULL", (loc,)).rowcount
         return n
 
+    def unlabel(self, paths: List[str]) -> int:
+        """Erase the labels of these images (back to 'not labeled yet'), e.g. to verify them again."""
+        n = 0
+        with self.tx() as c:
+            for i in range(0, len(paths), 500):
+                part = paths[i:i + 500]
+                n += c.execute("UPDATE images SET age=NULL,emotion=NULL,gender=NULL,overlay=NULL,valid=NULL,raw=NULL,"
+                               "seq=NULL WHERE path IN (%s)" % ",".join("?" * len(part)), part).rowcount
+        return n
+
     def move_paths(self, mapping: Dict[str, str]) -> None:
         if not mapping:
             return
